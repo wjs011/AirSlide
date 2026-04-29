@@ -28,3 +28,8 @@ coverage
 *.sw?
 
 *.tsbuildinfo
+
+# Python backend
+__pycache__/
+*.py[cod]
+airslide-backend/storage/

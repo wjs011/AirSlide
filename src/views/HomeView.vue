@@ -1,559 +1,1358 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   ArrowLeft,
   ArrowRight,
   Camera,
+  CheckCircle2,
   ChevronDown,
   ChevronUp,
   Expand,
+  FileUp,
   Hand,
+  Loader2,
+  Maximize2,
   Mic,
+  Minus,
   Monitor,
   Pause,
   PenLine,
   Settings,
-  ShieldCheck,
   Square,
+  UploadCloud,
   Video,
   X,
-  Minus,
-  Maximize2,
-  Circle
 } from 'lucide-vue-next'
 
-type ProcessStep = {
-  index: string
-  title: string
-  lines: string[]
-  icon: 'camera' | 'joints' | 'gesture' | 'shield' | 'monitor'
+type Slide = {
+  index: number
+  url: string
+  width: number
+  height: number
 }
 
-const processSteps: ProcessStep[] = [
+type PresentationManifest = {
+  id: string
+  filename: string
+  slideCount: number
+  conversionMode: 'powerpoint' | 'text-fallback' | string
+  slides: Slide[]
+}
+
+type ToolMode = 'pointer' | 'pen' | 'zoom'
+
+const apiBase = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
+
+const fileInput = ref<HTMLInputElement | null>(null)
+const stageRef = ref<HTMLElement | null>(null)
+const videoRef = ref<HTMLVideoElement | null>(null)
+const cameraStream = ref<MediaStream | null>(null)
+const deck = ref<PresentationManifest | null>(null)
+const currentIndex = ref(0)
+const activeMode = ref<ToolMode>('pointer')
+const elapsedSeconds = ref(522)
+const isUploading = ref(false)
+const isDragging = ref(false)
+const recognitionPaused = ref(false)
+const cameraEnabled = ref(false)
+const cameraError = ref('')
+const errorMessage = ref('')
+
+let timerId: number | undefined
+
+const currentSlide = computed(() => deck.value?.slides[currentIndex.value] ?? null)
+const hasDeck = computed(() => Boolean(deck.value?.slides.length))
+const filename = computed(() => deck.value?.filename || '人工智能进展与未来趋势.pptx')
+const slideCount = computed(() => deck.value?.slideCount ?? 13)
+const displayIndex = computed(() => (hasDeck.value ? currentIndex.value + 1 : 8))
+const progress = computed(() => (displayIndex.value / slideCount.value) * 100)
+const conversionLabel = computed(() => {
+  if (!deck.value) return '原型演示'
+  return deck.value.conversionMode === 'powerpoint' ? '原始放映页' : '文本预览页'
+})
+const elapsedText = computed(() => {
+  const hours = Math.floor(elapsedSeconds.value / 3600)
+  const minutes = Math.floor((elapsedSeconds.value % 3600) / 60)
+  const seconds = elapsedSeconds.value % 60
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+})
+const modeText = computed(() => {
+  if (activeMode.value === 'pen') return '标注模式'
+  if (activeMode.value === 'zoom') return '区域放大'
+  return '空气指针'
+})
+const cameraStatusText = computed(() => {
+  if (cameraEnabled.value) return '摄像头已开启'
+  if (cameraError.value) return '摄像头模拟中'
+  return '摄像头已开启'
+})
+const faceStatusText = computed(() => {
+  if (cameraError.value) return '模拟人脸锁定 96%'
+  return '人脸锁定 96%'
+})
+
+const processSteps = [
   {
     index: '01',
     title: '摄像头采集手部图像',
-    lines: ['实时采集演讲者手部', '视频流'],
-    icon: 'camera'
+    desc: ['实时采集演讲者手部', '视频流'],
+    icon: 'camera',
   },
   {
     index: '02',
     title: '手部检测与关键点提取',
-    lines: ['检测手部区域并提取', '21 个关键点坐标'],
-    icon: 'joints'
+    desc: ['检测手部区域并提取', '21 个关键点坐标'],
+    icon: 'joints',
   },
   {
     index: '03',
     title: '手势识别',
-    lines: ['基于深度学习模型', '识别静态/动态手势'],
-    icon: 'gesture'
+    desc: ['基于深度学习模型', '识别静态 / 动态手势'],
+    icon: 'gesture',
   },
   {
     index: '04',
     title: '时序稳定与误判抑制',
-    lines: ['结合时间窗口与滤波算法', '提升稳定性与鲁棒性'],
-    icon: 'shield'
+    desc: ['结合时间窗口与滤波算法', '提升稳定性与鲁棒性'],
+    icon: 'shield',
   },
   {
     index: '05',
     title: '交互映射',
-    lines: ['将识别结果映射为', '演示控制指令'],
-    icon: 'monitor'
-  }
+    desc: ['将识别结果映射为', '演示控制指令'],
+    icon: 'monitor',
+  },
 ]
 
-const activeTool = ref('空写指针')
-const elapsed = ref('00:08:42')
+function slideUrl(slide: Slide) {
+  if (/^https?:\/\//.test(slide.url)) return slide.url
+  return `${apiBase}${slide.url}`
+}
 
-const statusLabel = computed(() => `演示中 ${elapsed.value}`)
+function pickFile() {
+  fileInput.value?.click()
+}
+
+function validateFile(file: File) {
+  if (!/\.(ppt|pptx)$/i.test(file.name)) {
+    throw new Error('请上传 .ppt 或 .pptx 文件')
+  }
+}
+
+async function uploadFile(file: File) {
+  validateFile(file)
+  isUploading.value = true
+  errorMessage.value = ''
+
+  try {
+    const formData = new FormData()
+    formData.append('file', file)
+
+    const response = await fetch(`${apiBase}/api/presentations`, {
+      method: 'POST',
+      body: formData,
+    })
+
+    if (!response.ok) {
+      let message = 'PPT 载入失败'
+      try {
+        const payload = await response.json()
+        message = payload.detail || message
+      } catch {
+        message = response.statusText || message
+      }
+      throw new Error(message)
+    }
+
+    deck.value = (await response.json()) as PresentationManifest
+    currentIndex.value = 0
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : 'PPT 载入失败'
+  } finally {
+    isUploading.value = false
+    isDragging.value = false
+  }
+}
+
+function onFileChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (file) void uploadFile(file)
+  input.value = ''
+}
+
+function onDrop(event: DragEvent) {
+  event.preventDefault()
+  const file = event.dataTransfer?.files?.[0]
+  if (file) void uploadFile(file)
+}
+
+function goToSlide(index: number) {
+  if (!deck.value) return
+  currentIndex.value = Math.min(Math.max(index, 0), deck.value.slideCount - 1)
+}
+
+function previousSlide() {
+  goToSlide(currentIndex.value - 1)
+}
+
+function nextSlide() {
+  goToSlide(currentIndex.value + 1)
+}
+
+async function enterFullscreen() {
+  if (!stageRef.value || document.fullscreenElement) return
+  await stageRef.value.requestFullscreen()
+}
+
+async function startCamera() {
+  cameraError.value = ''
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 360, facingMode: 'user' },
+      audio: false,
+    })
+    cameraStream.value = stream
+    cameraEnabled.value = true
+    await nextTick()
+    if (videoRef.value) {
+      videoRef.value.srcObject = stream
+      await videoRef.value.play()
+    }
+  } catch {
+    cameraEnabled.value = false
+    cameraError.value = '摄像头未授权'
+  }
+}
+
+function stopCamera() {
+  cameraStream.value?.getTracks().forEach((track) => track.stop())
+  cameraStream.value = null
+  cameraEnabled.value = false
+  if (videoRef.value) videoRef.value.srcObject = null
+}
+
+function toggleCamera() {
+  if (cameraEnabled.value) {
+    stopCamera()
+  } else {
+    void startCamera()
+  }
+}
+
+function endPresentation() {
+  deck.value = null
+  currentIndex.value = 0
+  activeMode.value = 'pointer'
+  recognitionPaused.value = false
+}
+
+function handleKeydown(event: KeyboardEvent) {
+  const target = event.target as HTMLElement | null
+  if (target?.tagName === 'INPUT' || target?.tagName === 'TEXTAREA') return
+
+  if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
+    event.preventDefault()
+    nextSlide()
+  }
+  if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
+    event.preventDefault()
+    previousSlide()
+  }
+  if (event.key === 'Home') {
+    event.preventDefault()
+    goToSlide(0)
+  }
+  if (event.key === 'End' && deck.value) {
+    event.preventDefault()
+    goToSlide(deck.value.slideCount - 1)
+  }
+  if (event.key.toLowerCase() === 'f') {
+    event.preventDefault()
+    void enterFullscreen()
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', handleKeydown)
+  timerId = window.setInterval(() => {
+    if (!recognitionPaused.value) elapsedSeconds.value += 1
+  }, 1000)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', handleKeydown)
+  if (timerId) window.clearInterval(timerId)
+  stopCamera()
+})
 </script>
 
 <template>
-  <main class="relative h-screen min-h-[760px] overflow-hidden bg-[#07101d] text-slate-100">
-    <header class="relative z-20 flex h-16 items-center justify-between border-b border-white/10 bg-[#091423]/95 px-6 shadow-[0_12px_40px_rgba(0,0,0,0.24)]">
-      <section class="flex min-w-0 items-center gap-5">
-        <div class="flex items-center gap-3">
-          <div class="grid h-9 w-9 place-items-center rounded-lg bg-gradient-to-br from-[#2d8dff] to-[#285de8] shadow-[0_10px_24px_rgba(45,125,255,0.36)]">
-            <div class="flex h-5 items-center gap-0.5">
-              <span class="h-2.5 w-0.5 rounded-full bg-white/95"></span>
-              <span class="h-4 w-0.5 rounded-full bg-white/95"></span>
-              <span class="h-6 w-0.5 rounded-full bg-white/95"></span>
-              <span class="h-4 w-0.5 rounded-full bg-white/95"></span>
-              <span class="h-2.5 w-0.5 rounded-full bg-white/95"></span>
-            </div>
-          </div>
-          <h1 class="whitespace-nowrap text-xl font-semibold tracking-wide text-white">智能演讲辅助系统</h1>
+  <main class="prototype-shell">
+    <input
+      ref="fileInput"
+      class="sr-only"
+      type="file"
+      accept=".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+      @change="onFileChange"
+    />
+
+    <header class="top-bar">
+      <section class="brand-zone">
+        <div class="app-logo">
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
         </div>
-        <div class="h-8 w-px bg-white/12"></div>
-        <div class="flex items-center gap-2.5 whitespace-nowrap text-base text-slate-200">
-          <span class="h-2.5 w-2.5 rounded-full bg-[#17e68d] shadow-[0_0_18px_rgba(23,230,141,0.8)]"></span>
-          <span>{{ statusLabel }}</span>
+        <h1>智能演讲辅助系统</h1>
+        <div class="divider"></div>
+        <div class="live-state">
+          <i></i>
+          <span>演示中 {{ elapsedText }}</span>
         </div>
       </section>
 
-      <section class="absolute left-1/2 flex -translate-x-1/2 items-center gap-2 text-base font-medium text-slate-100">
-        <span>人工智能进展与未来趋势.pptx</span>
-        <ChevronDown class="h-4 w-4 text-slate-400" />
-      </section>
+      <button class="file-title" type="button" @click="pickFile">
+        <span>{{ filename }}</span>
+        <ChevronDown :size="16" />
+      </button>
 
-      <section class="flex items-center gap-5 text-slate-300">
-        <div class="flex items-center gap-2">
-          <Mic class="h-5 w-5" />
-          <div class="flex items-end gap-1 text-[#18e193]">
-            <span class="h-3 w-1 rounded-full bg-current"></span>
-            <span class="h-4 w-1 rounded-full bg-current"></span>
-            <span class="h-4 w-1 rounded-full bg-current"></span>
-          </div>
-        </div>
-        <div class="h-7 w-px bg-white/10"></div>
-        <div class="flex items-center gap-2 whitespace-nowrap">
-          <Video class="h-5 w-5" />
-          <span>摄像头已开启</span>
-        </div>
-        <div class="h-7 w-px bg-white/10"></div>
-        <button class="flex items-center gap-2 whitespace-nowrap transition hover:text-white" type="button">
-          <Settings class="h-5 w-5" />
+      <section class="device-zone">
+        <button class="icon-status" type="button" title="麦克风状态">
+          <Mic :size="22" />
+          <span class="level-bars"><i></i><i></i><i></i></span>
+        </button>
+        <div class="divider"></div>
+        <button class="camera-toggle" type="button" @click="toggleCamera">
+          <Video :size="22" />
+          <span>{{ cameraStatusText }}</span>
+        </button>
+        <div class="divider"></div>
+        <button class="settings-button" type="button">
+          <Settings :size="22" />
           <span>设置</span>
         </button>
-        <div class="h-7 w-px bg-white/10"></div>
-        <div class="flex items-center gap-5">
-          <Minus class="h-5 w-5" />
-          <Maximize2 class="h-4 w-4" />
-          <X class="h-5 w-5" />
+        <button class="upload-button" type="button" :disabled="isUploading" @click="pickFile">
+          <Loader2 v-if="isUploading" :size="18" class="spin" />
+          <FileUp v-else :size="18" />
+          <span>{{ isUploading ? '转换中' : '上传 PPT' }}</span>
+        </button>
+        <div class="window-actions">
+          <Minus :size="20" />
+          <Maximize2 :size="18" />
+          <X :size="21" />
         </div>
       </section>
     </header>
 
-    <section class="relative h-[calc(100vh-146px)] min-h-[614px] overflow-hidden bg-[#091321] p-4">
-      <article class="relative h-full overflow-hidden rounded-[3px] bg-[#f7fbff] text-[#102748] shadow-[0_18px_50px_rgba(0,0,0,0.32)]">
-        <div class="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_48%_28%,rgba(255,255,255,0.9),rgba(238,246,255,0.96)_45%,rgba(226,239,255,0.92))]"></div>
-        <div class="pointer-events-none absolute -bottom-36 -left-28 h-[430px] w-[820px] rounded-[50%] border-t border-white/70 bg-[radial-gradient(ellipse_at_center,rgba(185,213,248,0.22),transparent_68%)]"></div>
-        <div class="pointer-events-none absolute -right-24 top-12 h-[620px] w-[620px] rounded-full border border-[#d8e7fa]/50 opacity-70"></div>
-        <div class="pointer-events-none absolute bottom-[-220px] right-[-130px] h-[640px] w-[980px] rotate-[-9deg] rounded-[50%] border-t border-white/70 bg-[repeating-linear-gradient(168deg,rgba(116,158,220,0.09)_0,rgba(116,158,220,0.09)_1px,transparent_1px,transparent_7px)] opacity-75"></div>
+    <section class="stage-area">
+      <article
+        ref="stageRef"
+        class="presentation-stage"
+        :class="{ dragging: isDragging }"
+        @dragenter.prevent="isDragging = true"
+        @dragover.prevent="isDragging = true"
+        @dragleave.prevent="isDragging = false"
+        @drop="onDrop"
+      >
+        <template v-if="currentSlide">
+          <img class="real-slide" :src="slideUrl(currentSlide)" :alt="`PPT 第 ${currentSlide.index} 页`" />
+        </template>
 
-        <aside class="absolute left-5 top-5 z-10 h-[134px] w-[256px] overflow-hidden rounded-lg bg-[#3d4856]/75 shadow-[0_18px_45px_rgba(23,46,79,0.18)] backdrop-blur">
-          <div class="absolute left-3 top-3 z-20 h-4 w-4 rounded-full border border-white/80 bg-[#15b77b] shadow-[0_0_0_3px_rgba(21,183,123,0.22)]"></div>
-          <div class="absolute inset-y-0 left-0 w-[152px] overflow-hidden bg-[linear-gradient(110deg,#384352,#1b2531)]">
-            <div class="face-hair"></div>
-            <div class="face"></div>
-            <div class="ear left-ear"></div>
-            <div class="ear right-ear"></div>
-            <div class="glass left-glass"></div>
-            <div class="glass right-glass"></div>
-            <div class="glass-bridge"></div>
-            <div class="eye left-eye"></div>
-            <div class="eye right-eye"></div>
-            <div class="nose"></div>
-            <div class="mouth"></div>
-            <div class="neck"></div>
-            <div class="shirt"></div>
-            <div class="scan-corner corner-lt"></div>
-            <div class="scan-corner corner-rt"></div>
-            <div class="scan-corner corner-lb"></div>
-            <div class="scan-corner corner-rb"></div>
+        <template v-else>
+          <section class="demo-slide">
+            <div class="slide-bg-line line-one"></div>
+            <div class="slide-bg-line line-two"></div>
+            <div class="slide-heading">
+              <h2>手势识别模块</h2>
+              <span></span>
+              <p>通过计算机视觉与深度学习技术，识别演讲者的手势并映射为演示控制指令，实现自然、无接触的交互体验。</p>
+            </div>
+
+            <div class="process-row">
+              <article v-for="(step, index) in processSteps" :key="step.index" class="process-step">
+                <div v-if="index < processSteps.length - 1" class="step-arrow">
+                  <span></span>
+                  <ArrowRight :size="28" />
+                </div>
+                <div class="step-icon">
+                  <b>{{ step.index }}</b>
+                  <Camera v-if="step.icon === 'camera'" :size="68" />
+                  <div v-else-if="step.icon === 'joints'" class="hand-points">
+                    <i v-for="point in 11" :key="point" :class="`point-${point}`"></i>
+                    <em v-for="line in 5" :key="line" :class="`line-${line}`"></em>
+                  </div>
+                  <Hand v-else-if="step.icon === 'gesture'" :size="72" />
+                  <CheckCircle2 v-else-if="step.icon === 'shield'" :size="76" />
+                  <Monitor v-else :size="76" />
+                </div>
+                <h3>{{ step.title }}</h3>
+                <p>
+                  <span v-for="line in step.desc" :key="line">{{ line }}</span>
+                </p>
+              </article>
+            </div>
+
+            <svg class="pointer-path" viewBox="0 0 230 160" aria-hidden="true">
+              <path d="M12 22 C 44 60, 82 24, 102 60 S 124 128, 214 134" />
+              <circle cx="12" cy="22" r="14" />
+            </svg>
+          </section>
+        </template>
+
+        <aside class="camera-preview">
+          <span class="camera-dot"></span>
+          <video v-show="cameraEnabled" ref="videoRef" muted playsinline></video>
+          <div v-if="!cameraEnabled" class="mock-face">
+            <div class="hair"></div>
+            <div class="head"></div>
+            <div class="glasses left"></div>
+            <div class="glasses right"></div>
+            <div class="bridge"></div>
+            <span class="eye eye-left"></span>
+            <span class="eye eye-right"></span>
+            <span class="mouth"></span>
           </div>
-          <div class="absolute left-[150px] top-[58px] space-y-2 text-sm font-semibold leading-none text-white">
-            <p>人脸锁定 96%</p>
-            <p>距离 2.8m</p>
+          <div class="face-frame"></div>
+          <div class="camera-copy">
+            <strong>{{ faceStatusText }}</strong>
+            <span>距离 2.8m</span>
           </div>
         </aside>
 
-        <section class="relative z-10 mx-auto flex h-full max-w-[1480px] flex-col items-center px-16 pb-14 pt-16">
-          <div class="text-center">
-            <h2 class="text-[54px] font-bold leading-none tracking-[0.16em] text-[#0c2549]">手势识别模块</h2>
-            <div class="mx-auto mt-5 h-1 w-[68px] rounded-full bg-gradient-to-r from-[#1f7fff] via-[#1f7fff] to-[#89b5ff]"></div>
-            <p class="mt-7 text-[18px] font-medium tracking-wide text-[#56657a]">
-              通过计算机视觉与深度学习技术，识别演讲者的手势并映射为演示控制指令，实现自然、无接触的交互体验。
-            </p>
-          </div>
+        <aside class="assist-card">
+          <p>
+            <Hand :size="23" />
+            <span>右滑：下一页</span>
+          </p>
+          <p>
+            <Mic :size="23" />
+            <span>语音：放大此区域</span>
+          </p>
+          <p>
+            <i></i>
+            <span>{{ recognitionPaused ? '识别已暂停' : '延迟 38ms' }}</span>
+          </p>
+        </aside>
 
-          <div class="mt-20 grid w-full grid-cols-5 items-start gap-8">
-            <template v-for="(step, stepIndex) in processSteps" :key="step.index">
-              <article class="relative flex flex-col items-center text-center">
-                <div v-if="stepIndex < processSteps.length - 1" class="absolute left-[calc(50%+105px)] top-[85px] hidden h-px w-[110px] border-t border-dashed border-[#78a8ff] xl:block">
-                  <ArrowRight class="absolute -right-2 -top-[11px] h-6 w-6 fill-[#2e7af0] text-[#2e7af0]" />
-                </div>
-                <div class="relative grid h-[172px] w-[172px] place-items-center rounded-full border-2 border-[#7aa9ff] bg-[radial-gradient(circle,rgba(218,232,251,0.72)_0%,rgba(245,250,255,0.96)_62%,rgba(238,246,255,0.96)_100%)] shadow-[inset_0_0_38px_rgba(99,148,220,0.14)]">
-                  <span class="absolute -left-2 -top-3 grid h-11 w-11 place-items-center rounded-full bg-gradient-to-b from-[#1f84ff] to-[#2867d9] text-xl font-bold text-white shadow-[0_8px_18px_rgba(32,117,228,0.28)]">{{ step.index }}</span>
+        <button v-if="!hasDeck" class="quick-upload" type="button" @click="pickFile">
+          <UploadCloud :size="18" />
+          <span>上传真实 PPT</span>
+        </button>
 
-                  <Camera v-if="step.icon === 'camera'" class="h-[72px] w-[72px] fill-[#3e7ed9]/80 text-[#316fd0]" stroke-width="1.7" />
-                  <div v-else-if="step.icon === 'joints'" class="relative h-[92px] w-[92px]">
-                    <div class="joint-line line-a"></div>
-                    <div class="joint-line line-b"></div>
-                    <div class="joint-line line-c"></div>
-                    <div class="joint-line line-d"></div>
-                    <div class="joint-line line-e"></div>
-                    <span v-for="point in 11" :key="point" :class="`joint joint-${point}`"></span>
-                  </div>
-                  <Hand v-else-if="step.icon === 'gesture'" class="h-[78px] w-[78px] text-[#2f73d5]" stroke-width="2.3" />
-                  <ShieldCheck v-else-if="step.icon === 'shield'" class="h-[82px] w-[82px] fill-[#3e7ed9]/70 text-[#2f73d5]" stroke-width="1.9" />
-                  <Monitor v-else class="h-[82px] w-[82px] fill-[#3e7ed9]/60 text-[#2f73d5]" stroke-width="1.8" />
-                </div>
+        <div v-if="isUploading" class="loading-mask">
+          <Loader2 :size="26" class="spin" />
+          <span>正在转换 PPT 页面</span>
+        </div>
 
-                <h3 class="mt-6 text-[20px] font-bold tracking-wide text-[#102847]">{{ step.title }}</h3>
-                <p class="mt-3 text-[17px] leading-[1.75] tracking-wide text-[#657184]">
-                  <span v-for="line in step.lines" :key="line" class="block">{{ line }}</span>
-                </p>
-              </article>
-            </template>
-          </div>
+        <div v-if="errorMessage" class="error-toast">
+          {{ errorMessage }}
+        </div>
 
-          <div class="absolute bottom-[212px] right-[260px] h-[110px] w-[150px] border-l-[3px] border-t-[3px] border-[#5c99f4] opacity-80 connection-path">
-            <span class="absolute -left-[14px] -top-[14px] h-6 w-6 rounded-full border-[4px] border-[#2c87ff] bg-white shadow-[0_9px_20px_rgba(42,126,232,0.45)]"></span>
-          </div>
-
-          <aside class="absolute bottom-6 right-6 z-20 w-[258px] rounded-lg bg-[#667487]/72 p-6 text-[17px] font-medium text-white shadow-[0_22px_48px_rgba(43,65,94,0.22)] backdrop-blur-md">
-            <p class="flex items-center gap-3">
-              <Hand class="h-6 w-6" />
-              <span>右滑：下一页</span>
-            </p>
-            <p class="mt-5 flex items-center gap-3">
-              <Mic class="h-6 w-6" />
-              <span>语音：放大此区域</span>
-            </p>
-            <p class="mt-8 flex items-center gap-3">
-              <span class="h-3 w-3 rounded-full bg-[#14e68e] shadow-[0_0_14px_rgba(20,230,142,0.8)]"></span>
-              <span>延迟 38ms</span>
-            </p>
-          </aside>
-        </section>
+        <div class="slide-progress">
+          <span :style="{ width: `${progress}%` }"></span>
+        </div>
       </article>
     </section>
 
-    <footer class="relative z-20 flex h-20 items-center gap-8 border-t border-white/8 bg-[#111d2c] px-7 shadow-[0_-16px_48px_rgba(0,0,0,0.26)]">
-      <button class="grid h-11 w-14 place-items-center rounded-2xl bg-white/8 text-slate-300 shadow-inner shadow-white/5 transition hover:bg-white/12" type="button" aria-label="展开">
-        <ChevronUp class="h-7 w-7" />
+    <footer class="bottom-bar">
+      <button class="collapse-button" type="button">
+        <ChevronUp :size="30" />
       </button>
 
-      <nav class="flex flex-1 items-center justify-center gap-9">
-        <button class="control-button" type="button">
-          <ArrowLeft class="h-8 w-8" />
+      <nav class="tool-strip">
+        <button class="tool-button" type="button" :disabled="!hasDeck || currentIndex === 0" @click="previousSlide">
+          <ArrowLeft :size="34" />
           <span>上一页</span>
         </button>
-        <button class="control-button" type="button">
-          <ArrowRight class="h-8 w-8" />
+        <button
+          class="tool-button"
+          type="button"
+          :disabled="!hasDeck || currentIndex >= (deck?.slideCount ?? 1) - 1"
+          @click="nextSlide"
+        >
+          <ArrowRight :size="34" />
           <span>下一页</span>
         </button>
-        <button class="control-button is-active relative" type="button" @click="activeTool = '空写指针'">
-          <span class="absolute -top-1 left-1/2 h-2.5 w-2.5 -translate-x-1/2 rounded-full bg-[#287fff]"></span>
-          <Hand class="h-8 w-8" />
-          <span>{{ activeTool }}</span>
+        <button class="tool-button active" type="button" @click="activeMode = 'pointer'">
+          <Hand :size="33" />
+          <span>空气指针</span>
         </button>
-        <button class="control-button" type="button" @click="activeTool = '标注'">
-          <PenLine class="h-8 w-8" />
+        <button class="tool-button" :class="{ selected: activeMode === 'pen' }" type="button" @click="activeMode = 'pen'">
+          <PenLine :size="32" />
           <span>标注</span>
         </button>
-        <button class="control-button" type="button">
-          <Expand class="h-8 w-8" />
+        <button class="tool-button" :class="{ selected: activeMode === 'zoom' }" type="button" @click="activeMode = 'zoom'">
+          <Expand :size="32" />
           <span>区域放大</span>
         </button>
-        <button class="control-button" type="button">
-          <Pause class="h-8 w-8 fill-white text-white" />
-          <span>暂停识别</span>
+        <button class="tool-button" type="button" @click="recognitionPaused = !recognitionPaused">
+          <Pause :size="34" />
+          <span>{{ recognitionPaused ? '继续识别' : '暂停识别' }}</span>
         </button>
-        <button class="control-button danger" type="button">
-          <Square class="h-6 w-6 fill-[#ff686d] text-[#ff686d]" />
+        <button class="tool-button danger" type="button" @click="endPresentation">
+          <Square :size="25" />
           <span>结束演示</span>
         </button>
       </nav>
+
+      <div class="footer-meta">
+        <span>{{ conversionLabel }}</span>
+        <b>{{ displayIndex }} / {{ slideCount }}</b>
+        <button type="button" @click="enterFullscreen">全屏</button>
+      </div>
     </footer>
   </main>
 </template>
 
 <style scoped>
-.control-button {
-  display: inline-flex;
-  height: 62px;
-  min-width: 160px;
+.prototype-shell {
+  display: grid;
+  min-height: 100vh;
+  grid-template-rows: 64px minmax(0, 1fr) 96px;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 50% 20%, rgb(40 67 104 / 0.2), transparent 42%),
+    linear-gradient(180deg, #0a1423 0%, #121e2d 100%);
+  color: #f5f8ff;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+}
+
+.top-bar,
+.bottom-bar {
+  position: relative;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  background: rgb(10 20 35 / 0.96);
+  box-shadow: 0 10px 34px rgb(0 0 0 / 0.28);
+}
+
+.top-bar {
+  justify-content: space-between;
+  gap: 24px;
+  border-bottom: 1px solid rgb(255 255 255 / 0.09);
+  padding: 0 28px;
+}
+
+.brand-zone,
+.device-zone,
+.live-state,
+.icon-status,
+.camera-toggle,
+.settings-button,
+.file-title,
+.upload-button,
+.window-actions {
+  display: flex;
+  align-items: center;
+}
+
+.brand-zone {
+  min-width: 370px;
+  gap: 16px;
+}
+
+.app-logo {
+  display: flex;
+  width: 40px;
+  height: 40px;
   align-items: center;
   justify-content: center;
-  gap: 14px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.11), rgba(255, 255, 255, 0.055));
-  color: rgb(229 237 248);
-  font-size: 20px;
-  font-weight: 600;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08), 0 10px 26px rgba(0, 0, 0, 0.13);
-  transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
+  gap: 2px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #2d91ff, #275de8);
+  box-shadow: 0 12px 26px rgb(45 125 255 / 0.34);
 }
 
-.control-button:hover {
-  border-color: rgba(128, 172, 255, 0.55);
-  color: white;
-}
-
-.control-button.is-active {
-  border-color: rgba(69, 137, 255, 0.88);
-  background: linear-gradient(180deg, rgba(42, 115, 226, 0.28), rgba(47, 102, 187, 0.18));
-  color: #8fbdff;
-}
-
-.control-button.danger {
-  border-color: rgba(255, 103, 111, 0.42);
-  color: #ff7278;
-}
-
-.face-hair {
-  position: absolute;
-  left: 36px;
-  top: 20px;
-  width: 82px;
-  height: 60px;
-  border-radius: 48% 48% 42% 42%;
-  background: #151820;
-  box-shadow: -13px 7px 0 #11151d, 12px 4px 0 #11151d;
-}
-
-.face {
-  position: absolute;
-  left: 44px;
-  top: 44px;
-  width: 68px;
-  height: 72px;
-  border-radius: 42% 42% 46% 46%;
-  background: linear-gradient(#e0c0aa, #c89579);
-}
-
-.ear {
-  position: absolute;
-  top: 70px;
-  height: 18px;
-  width: 11px;
+.app-logo span {
+  width: 3px;
   border-radius: 999px;
-  background: #c99578;
+  background: white;
 }
 
-.left-ear {
-  left: 36px;
+.app-logo span:nth-child(1),
+.app-logo span:nth-child(5) {
+  height: 13px;
 }
 
-.right-ear {
-  left: 109px;
-}
-
-.neck {
-  position: absolute;
-  left: 65px;
-  top: 109px;
-  height: 19px;
-  width: 28px;
-  background: #bd856c;
-}
-
-.shirt {
-  position: absolute;
-  left: 38px;
-  top: 122px;
-  height: 34px;
-  width: 82px;
-  border-radius: 40% 40% 0 0;
-  background: #f3f5f8;
-}
-
-.glass {
-  position: absolute;
-  top: 67px;
+.app-logo span:nth-child(2),
+.app-logo span:nth-child(4) {
   height: 21px;
-  width: 26px;
-  border: 2px solid #252a33;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.05);
 }
 
-.left-glass {
-  left: 52px;
+.app-logo span:nth-child(3) {
+  height: 28px;
 }
 
-.right-glass {
-  left: 80px;
+.brand-zone h1 {
+  white-space: nowrap;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0;
 }
 
-.glass-bridge {
-  position: absolute;
-  left: 77px;
-  top: 76px;
-  height: 2px;
-  width: 6px;
-  background: #252a33;
+.divider {
+  width: 1px;
+  height: 28px;
+  background: rgb(255 255 255 / 0.13);
 }
 
-.eye {
-  position: absolute;
-  top: 76px;
-  height: 3px;
-  width: 8px;
+.live-state {
+  gap: 10px;
+  white-space: nowrap;
+  color: #d8e2f0;
+  font-size: 17px;
+}
+
+.live-state i,
+.assist-card i,
+.camera-dot {
+  width: 11px;
+  height: 11px;
   border-radius: 999px;
-  background: #1c2028;
+  background: #20e793;
+  box-shadow: 0 0 18px rgb(32 231 147 / 0.8);
 }
 
-.left-eye {
-  left: 60px;
+.file-title {
+  max-width: 580px;
+  min-width: 340px;
+  justify-content: center;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: #e8eef8;
+  font-size: 18px;
+  cursor: pointer;
 }
 
-.right-eye {
-  left: 89px;
+.file-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.nose {
-  position: absolute;
-  left: 76px;
-  top: 82px;
-  height: 14px;
-  width: 5px;
+.device-zone {
+  justify-content: flex-end;
+  gap: 18px;
+  min-width: 490px;
+  color: #d4deec;
+}
+
+.icon-status,
+.camera-toggle,
+.settings-button,
+.upload-button {
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.level-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  color: #16eb91;
+}
+
+.level-bars i {
+  width: 4px;
   border-radius: 999px;
-  border-right: 2px solid rgba(92, 53, 42, 0.38);
+  background: currentColor;
 }
 
-.mouth {
-  position: absolute;
-  left: 68px;
-  top: 100px;
-  height: 2px;
-  width: 22px;
-  border-radius: 999px;
-  background: rgba(86, 40, 40, 0.55);
+.level-bars i:nth-child(1) {
+  height: 13px;
 }
 
-.scan-corner {
-  position: absolute;
+.level-bars i:nth-child(2) {
   height: 19px;
-  width: 19px;
-  border-color: white;
-  opacity: 0.95;
 }
 
-.corner-lt {
-  left: 29px;
-  top: 38px;
-  border-left: 2px solid;
-  border-top: 2px solid;
+.level-bars i:nth-child(3) {
+  height: 19px;
 }
 
-.corner-rt {
-  left: 123px;
-  top: 38px;
-  border-right: 2px solid;
-  border-top: 2px solid;
+.upload-button {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-radius: 8px;
+  background: rgb(255 255 255 / 0.06);
 }
 
-.corner-lb {
-  left: 29px;
-  top: 118px;
-  border-left: 2px solid;
-  border-bottom: 2px solid;
+.window-actions {
+  gap: 18px;
+  color: #cfd9e8;
 }
 
-.corner-rb {
-  left: 123px;
-  top: 118px;
-  border-right: 2px solid;
-  border-bottom: 2px solid;
+.stage-area {
+  display: flex;
+  min-height: 0;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: linear-gradient(180deg, #07111f 0%, #0f1b2a 100%);
 }
 
-.joint {
+.presentation-stage {
+  position: relative;
+  width: min(100%, 1880px);
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid rgb(255 255 255 / 0.2);
+  border-radius: 4px;
+  background: #f7fbff;
+  box-shadow: 0 24px 58px rgb(0 0 0 / 0.36);
+}
+
+.presentation-stage.dragging {
+  outline: 3px solid rgb(32 126 255 / 0.7);
+}
+
+.real-slide {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: white;
+}
+
+.demo-slide {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 52% 20%, rgb(255 255 255 / 0.95), rgb(237 246 255 / 0.95) 46%, rgb(226 239 255 / 0.92)),
+    linear-gradient(135deg, #f9fcff, #eaf3ff);
+  color: #102849;
+}
+
+.slide-bg-line {
   position: absolute;
-  width: 10px;
-  height: 10px;
+  pointer-events: none;
+  border-radius: 50%;
+}
+
+.line-one {
+  right: -160px;
+  top: 70px;
+  width: 680px;
+  height: 680px;
+  border: 1px solid rgb(183 205 238 / 0.35);
+  box-shadow:
+    inset 20px 0 0 rgb(255 255 255 / 0.18),
+    inset 42px 0 0 rgb(255 255 255 / 0.16),
+    inset 68px 0 0 rgb(255 255 255 / 0.13);
+}
+
+.line-two {
+  left: -160px;
+  bottom: -300px;
+  width: 1180px;
+  height: 540px;
+  border-top: 1px solid rgb(206 220 241 / 0.78);
+  transform: rotate(9deg);
+}
+
+.slide-heading {
+  padding-top: 86px;
+  text-align: center;
+}
+
+.slide-heading h2 {
+  margin: 0;
+  color: #102849;
+  font-size: clamp(38px, 4.1vw, 72px);
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.slide-heading span {
+  display: block;
+  width: 76px;
+  height: 5px;
+  margin: 24px auto 28px;
   border-radius: 999px;
-  background: #3875d3;
-  box-shadow: 0 3px 9px rgba(56, 117, 211, 0.3);
+  background: linear-gradient(90deg, #1f7fff, #6da4ff);
 }
 
-.joint-line {
+.slide-heading p {
+  margin: 0 auto;
+  max-width: 980px;
+  color: #50627a;
+  font-size: clamp(15px, 1.08vw, 21px);
+  font-weight: 500;
+}
+
+.process-row {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 34px;
+  width: min(88%, 1640px);
+  margin: clamp(58px, 7vw, 96px) auto 0;
+}
+
+.process-step {
+  position: relative;
+  text-align: center;
+}
+
+.step-icon {
+  position: relative;
+  display: grid;
+  width: clamp(120px, 9.6vw, 192px);
+  height: clamp(120px, 9.6vw, 192px);
+  place-items: center;
+  margin: 0 auto;
+  border: 2px solid #78a8ff;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgb(221 234 252 / 0.8), rgb(247 251 255 / 0.96) 68%);
+  color: #3275d9;
+  box-shadow: inset 0 0 34px rgb(99 148 220 / 0.14);
+}
+
+.step-icon b {
   position: absolute;
-  left: 44px;
-  top: 58px;
+  left: -8px;
+  top: -12px;
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  border-radius: 999px;
+  background: linear-gradient(180deg, #1f84ff, #2867d9);
+  color: white;
+  font-size: 22px;
+  line-height: 1;
+  box-shadow: 0 8px 18px rgb(32 117 228 / 0.28);
+}
+
+.process-step h3 {
+  margin: 26px 0 0;
+  color: #102849;
+  font-size: clamp(17px, 1.25vw, 24px);
+  font-weight: 800;
+  line-height: 1.25;
+}
+
+.process-step p {
+  margin: 15px 0 0;
+  color: #68758a;
+  font-size: clamp(14px, 1.05vw, 21px);
+  line-height: 1.7;
+}
+
+.process-step p span {
+  display: block;
+}
+
+.step-arrow {
+  position: absolute;
+  left: calc(50% + 98px);
+  top: 84px;
+  display: flex;
+  width: 122px;
+  align-items: center;
+  color: #2e7af0;
+}
+
+.step-arrow span {
+  flex: 1;
+  border-top: 2px dashed #8bb5ff;
+}
+
+.hand-points {
+  position: relative;
+  width: 88px;
+  height: 88px;
+}
+
+.hand-points i,
+.hand-points em {
+  position: absolute;
+  display: block;
+}
+
+.hand-points i {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: #3976d3;
+}
+
+.hand-points em {
+  left: 42px;
+  top: 55px;
+  width: 48px;
   height: 2px;
-  width: 46px;
   transform-origin: left center;
   background: #78a8e8;
 }
 
-.line-a {
-  transform: rotate(-100deg);
+.hand-points .point-1 { left: 16px; top: 52px; }
+.hand-points .point-2 { left: 30px; top: 70px; }
+.hand-points .point-3 { left: 42px; top: 55px; }
+.hand-points .point-4 { left: 35px; top: 22px; }
+.hand-points .point-5 { left: 52px; top: 14px; }
+.hand-points .point-6 { left: 63px; top: 48px; }
+.hand-points .point-7 { left: 78px; top: 28px; }
+.hand-points .point-8 { left: 52px; top: 40px; }
+.hand-points .point-9 { left: 20px; top: 35px; }
+.hand-points .point-10 { left: 70px; top: 68px; }
+.hand-points .point-11 { left: 58px; top: 76px; }
+.hand-points .line-1 { transform: rotate(-101deg); }
+.hand-points .line-2 { transform: rotate(-74deg); }
+.hand-points .line-3 { transform: rotate(-48deg); }
+.hand-points .line-4 { transform: rotate(-18deg); }
+.hand-points .line-5 { transform: rotate(22deg); }
+
+.pointer-path {
+  position: absolute;
+  right: 17.5%;
+  bottom: 25%;
+  width: 168px;
+  height: 118px;
+  overflow: visible;
 }
 
-.line-b {
-  transform: rotate(-74deg);
+.pointer-path path {
+  fill: none;
+  stroke: #5b98f3;
+  stroke-width: 5;
+  stroke-linecap: round;
+  filter: drop-shadow(0 8px 14px rgb(40 110 210 / 0.22));
 }
 
-.line-c {
-  transform: rotate(-48deg);
+.pointer-path circle {
+  fill: white;
+  stroke: #2c87ff;
+  stroke-width: 6;
 }
 
-.line-d {
-  transform: rotate(-18deg);
+.camera-preview {
+  position: absolute;
+  left: 24px;
+  top: 22px;
+  z-index: 6;
+  width: clamp(220px, 15.5vw, 292px);
+  height: clamp(112px, 8.1vw, 154px);
+  overflow: hidden;
+  border-radius: 10px;
+  background: rgb(55 65 78 / 0.75);
+  box-shadow: 0 18px 42px rgb(23 46 79 / 0.18);
+  backdrop-filter: blur(12px);
 }
 
-.line-e {
-  transform: rotate(22deg);
+.camera-dot {
+  position: absolute;
+  left: 13px;
+  top: 13px;
+  z-index: 4;
+  width: 14px;
+  height: 14px;
+  border: 2px solid white;
 }
 
-.joint-1 {
-  left: 19px;
-  top: 54px;
+.camera-preview video {
+  width: 58%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
 }
 
-.joint-2 {
-  left: 33px;
-  top: 71px;
+.mock-face {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 58%;
+  background: linear-gradient(110deg, #384352, #1b2531);
 }
 
-.joint-3 {
-  left: 44px;
-  top: 58px;
+.hair,
+.head,
+.glasses,
+.bridge,
+.eye,
+.mouth {
+  position: absolute;
 }
 
-.joint-4 {
-  left: 39px;
-  top: 25px;
+.hair {
+  left: 32%;
+  top: 14%;
+  width: 44%;
+  height: 38%;
+  border-radius: 48% 48% 42% 42%;
+  background: #151820;
+  box-shadow: -12px 7px 0 #11151d, 12px 4px 0 #11151d;
 }
 
-.joint-5 {
-  left: 55px;
-  top: 18px;
+.head {
+  left: 34%;
+  top: 30%;
+  width: 40%;
+  height: 48%;
+  border-radius: 42% 42% 46% 46%;
+  background: linear-gradient(#e0c0aa, #c89579);
 }
 
-.joint-6 {
-  left: 65px;
-  top: 52px;
+.glasses {
+  top: 47%;
+  width: 16%;
+  height: 15%;
+  border: 2px solid #252a33;
+  border-radius: 8px;
 }
 
-.joint-7 {
-  left: 78px;
-  top: 30px;
+.glasses.left {
+  left: 39%;
 }
 
-.joint-8 {
-  left: 52px;
-  top: 43px;
+.glasses.right {
+  left: 56%;
 }
 
-.joint-9 {
-  left: 23px;
-  top: 38px;
+.bridge {
+  left: 55%;
+  top: 55%;
+  width: 6%;
+  height: 2px;
+  background: #252a33;
 }
 
-.joint-10 {
-  left: 70px;
-  top: 70px;
+.eye {
+  top: 55%;
+  width: 6%;
+  height: 3px;
+  border-radius: 999px;
+  background: #1c2028;
 }
 
-.joint-11 {
-  left: 58px;
-  top: 77px;
+.eye-left {
+  left: 44%;
 }
 
-.connection-path {
-  border-radius: 0 42px 0 0;
-  transform: rotate(16deg);
+.eye-right {
+  left: 61%;
 }
 
-@media (max-width: 1360px) {
-  .control-button {
+.mouth {
+  left: 49%;
+  top: 72%;
+  width: 15%;
+  height: 2px;
+  border-radius: 999px;
+  background: rgb(86 40 40 / 0.55);
+}
+
+.face-frame {
+  position: absolute;
+  left: 11%;
+  top: 27%;
+  width: 38%;
+  height: 62%;
+  border: 2px solid white;
+  box-shadow: 0 0 0 1px rgb(31 130 255 / 0.15);
+}
+
+.camera-copy {
+  position: absolute;
+  left: 58%;
+  top: 50%;
+  display: grid;
+  gap: 7px;
+  transform: translateY(-50%);
+  color: white;
+  font-size: clamp(13px, 0.95vw, 18px);
+  line-height: 1.25;
+}
+
+.camera-copy strong {
+  font-weight: 800;
+}
+
+.assist-card {
+  position: absolute;
+  right: 28px;
+  bottom: 28px;
+  z-index: 5;
+  width: clamp(226px, 15.4vw, 292px);
+  padding: 22px 26px;
+  border-radius: 10px;
+  background: rgb(82 94 112 / 0.7);
+  color: white;
+  font-size: clamp(15px, 1.08vw, 20px);
+  font-weight: 600;
+  box-shadow: 0 22px 48px rgb(43 65 94 / 0.2);
+  backdrop-filter: blur(14px);
+}
+
+.assist-card p {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  margin: 0;
+}
+
+.assist-card p + p {
+  margin-top: 18px;
+}
+
+.quick-upload {
+  position: absolute;
+  left: 50%;
+  bottom: 22px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  transform: translateX(-50%);
+  border: 0;
+  border-radius: 8px;
+  background: rgb(16 38 66 / 0.72);
+  color: white;
+  padding: 10px 15px;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+}
+
+.loading-mask {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: rgb(8 19 34 / 0.76);
+  color: white;
+  font-size: 18px;
+  backdrop-filter: blur(8px);
+}
+
+.spin {
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.error-toast {
+  position: absolute;
+  left: 50%;
+  top: 20px;
+  z-index: 11;
+  max-width: min(760px, 72%);
+  transform: translateX(-50%);
+  border: 1px solid rgb(255 144 92 / 0.34);
+  border-radius: 8px;
+  background: rgb(82 38 30 / 0.84);
+  color: #ffd7c2;
+  padding: 12px 16px;
+}
+
+.slide-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 4px;
+  background: rgb(15 33 58 / 0.14);
+}
+
+.slide-progress span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #1f84ff, #13d59d);
+}
+
+.bottom-bar {
+  gap: 24px;
+  border-top: 1px solid rgb(255 255 255 / 0.08);
+  padding: 0 28px;
+}
+
+.collapse-button {
+  display: grid;
+  width: 64px;
+  height: 58px;
+  place-items: center;
+  border: 0;
+  border-radius: 18px;
+  background: rgb(255 255 255 / 0.07);
+  color: #dbe5f4;
+  cursor: pointer;
+}
+
+.tool-strip {
+  display: flex;
+  flex: 1;
+  justify-content: center;
+  gap: clamp(14px, 2vw, 38px);
+}
+
+.tool-button {
+  display: inline-flex;
+  min-width: 166px;
+  height: 64px;
+  align-items: center;
+  justify-content: center;
+  gap: 13px;
+  border: 1px solid rgb(255 255 255 / 0.11);
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgb(255 255 255 / 0.1), rgb(255 255 255 / 0.045));
+  color: #f3f7ff;
+  font-size: 20px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.05);
+  transition:
+    border-color 160ms ease,
+    background-color 160ms ease,
+    color 160ms ease,
+    transform 160ms ease;
+}
+
+.tool-button:hover:not(:disabled) {
+  border-color: rgb(122 169 255 / 0.62);
+  transform: translateY(-1px);
+}
+
+.tool-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.tool-button.active,
+.tool-button.selected {
+  border-color: rgb(71 132 242 / 0.72);
+  background: rgb(37 93 167 / 0.34);
+  color: #8ebcff;
+  box-shadow: inset 0 0 0 1px rgb(55 120 237 / 0.22);
+}
+
+.tool-button.danger {
+  border-color: rgb(255 93 103 / 0.34);
+  color: #ff6e76;
+}
+
+.tool-button.danger svg {
+  fill: currentColor;
+}
+
+.footer-meta {
+  display: none;
+}
+
+@media (max-width: 1400px) {
+  .device-zone {
+    min-width: 390px;
+  }
+
+  .camera-toggle span,
+  .settings-button span,
+  .upload-button span {
+    display: none;
+  }
+
+  .tool-button {
     min-width: 132px;
     font-size: 17px;
+  }
+
+  .process-row {
+    gap: 18px;
+  }
+
+  .step-arrow {
+    left: calc(50% + 72px);
+    width: 84px;
+  }
+}
+
+@media (max-width: 980px) {
+  .prototype-shell {
+    grid-template-rows: auto minmax(0, 1fr) auto;
+  }
+
+  .top-bar {
+    flex-wrap: wrap;
+    height: auto;
+    padding: 12px;
+  }
+
+  .brand-zone,
+  .device-zone,
+  .file-title {
+    min-width: 0;
+    width: 100%;
+    justify-content: center;
+  }
+
+  .stage-area {
+    padding: 10px;
+  }
+
+  .presentation-stage {
+    width: 100%;
+  }
+
+  .camera-preview {
+    width: 190px;
+    height: 96px;
+  }
+
+  .assist-card {
+    display: none;
+  }
+
+  .process-row {
+    grid-template-columns: repeat(5, 1fr);
+    width: 94%;
+    gap: 8px;
+  }
+
+  .process-step h3 {
+    font-size: 12px;
+  }
+
+  .process-step p,
+  .step-arrow {
+    display: none;
+  }
+
+  .bottom-bar {
+    padding: 12px;
+  }
+
+  .collapse-button {
+    display: none;
+  }
+
+  .tool-strip {
+    flex-wrap: wrap;
+  }
+
+  .tool-button {
+    min-width: 120px;
+    height: 48px;
+    font-size: 15px;
   }
 }
 </style>

@@ -1,33 +1,32 @@
-# airslide
+# AirSlide
 
-This template should help get you started developing with Vue 3 in Vite.
+AirSlide 是一个面向课堂汇报和演讲场景的 PPT 放映 Web 应用。当前阶段只实现 PPT 上传、后端转换和前端翻页放映，摄像头、手势识别、语音控制后续再接入。
 
-## Recommended IDE Setup
+## 运行后端
 
-[VSCode](https://code.visualstudio.com/) + [Volar](https://marketplace.visualstudio.com/items?itemName=Vue.volar) (and disable Vetur).
-
-## Type Support for `.vue` Imports in TS
-
-TypeScript cannot handle type information for `.vue` imports by default, so we replace the `tsc` CLI with `vue-tsc` for type checking. In editors, we need [Volar](https://marketplace.visualstudio.com/items?itemName=Vue.volar) to make the TypeScript language service aware of `.vue` types.
-
-## Customize configuration
-
-See [Vite Configuration Reference](https://vite.dev/config/).
-
-## Project Setup
-
-```sh
-npm install
+```powershell
+cd airslide-backend
+python -m pip install -r requirements.txt
+python -m uvicorn main:socket_app --reload --host 127.0.0.1 --port 8000
 ```
 
-### Compile and Hot-Reload for Development
+后端是 Python + FastAPI。上传的 PPT 会保存到 `airslide-backend/storage/`，并转换成逐页可访问的放映画面。
 
-```sh
+在 Windows 且安装了 PowerPoint 时，后端会优先调用 PowerPoint 导出高清图片；如果导出不可用，会从 `.pptx` 中提取文字生成预览页，保证放映流程可以跑通。
+
+## 运行前端
+
+```powershell
+npm install
 npm run dev
 ```
 
-### Type-Check, Compile and Minify for Production
+前端默认通过 Vite 代理访问 `http://127.0.0.1:8000` 的后端接口。打开终端中显示的本地地址后，上传 `.ppt` 或 `.pptx` 文件即可开始放映。
 
-```sh
-npm run build
-```
+## 快捷键
+
+- `←` / `PageUp`：上一页
+- `→` / `PageDown` / `Space`：下一页
+- `Home`：第一页
+- `End`：最后一页
+- `F`：全屏放映
