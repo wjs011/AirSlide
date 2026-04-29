@@ -41,14 +41,72 @@ type PresentationManifest = {
 
 type ToolMode = 'pointer' | 'pen' | 'zoom'
 
+type Point = {
+  x: number
+  y: number
+}
+
+type AnnotationLine = {
+  id: number
+  points: Point[]
+}
+
+type VisionResult = {
+  status: string
+  latencyMs: number
+  face?: {
+    box: { x: number; y: number; width: number; height: number }
+    center: Point
+    confidence: number
+    distanceMeters: number
+  } | null
+  hand?: {
+    center: Point
+    box: { x: number; y: number; width: number; height: number }
+    pose: string
+    confidence: number
+  } | null
+  gesture?: {
+    name: string
+    action: 'next' | 'previous' | 'pointer' | 'open_hand'
+    confidence: number
+  } | null
+}
+
+type VisionSettings = {
+  cooldownSeconds: number
+  swipeThreshold: number
+  confidenceThreshold: number
+}
+
+type SpeechRecognitionLike = {
+  lang: string
+  continuous: boolean
+  interimResults: boolean
+  onresult: ((event: any) => void) | null
+  onend: (() => void) | null
+  onerror: (() => void) | null
+  start: () => void
+  stop: () => void
+}
+
+declare global {
+  interface Window {
+    SpeechRecognition?: new () => SpeechRecognitionLike
+    webkitSpeechRecognition?: new () => SpeechRecognitionLike
+  }
+}
+
 const apiBase = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const stageRef = ref<HTMLElement | null>(null)
 const videoRef = ref<HTMLVideoElement | null>(null)
+const frameCanvasRef = ref<HTMLCanvasElement | null>(null)
 const cameraStream = ref<MediaStream | null>(null)
 const deck = ref<PresentationManifest | null>(null)
 const currentIndex = ref(0)
+const demoIndex = ref(7)
 const activeMode = ref<ToolMode>('pointer')
 const elapsedSeconds = ref(522)
 const isUploading = ref(false)
@@ -57,14 +115,36 @@ const recognitionPaused = ref(false)
 const cameraEnabled = ref(false)
 const cameraError = ref('')
 const errorMessage = ref('')
+const visionResult = ref<VisionResult | null>(null)
+const visionStatus = ref('视觉待机')
+const pointerPosition = ref<Point>({ x: 0.72, y: 0.58 })
+const zoomPoint = ref<Point>({ x: 0.72, y: 0.55 })
+const annotations = ref<AnnotationLine[]>([])
+const drawingLine = ref<AnnotationLine | null>(null)
+const voiceEnabled = ref(false)
+const voiceSupported = ref(true)
+const lastVoiceText = ref('等待语音')
+const speechRecognition = ref<SpeechRecognitionLike | null>(null)
+const showEndConfirm = ref(false)
+const pendingEndByVoice = ref(false)
+const showSettings = ref(false)
+const externalControlEnabled = ref(false)
+const visionSettings = ref<VisionSettings>({
+  cooldownSeconds: 1.25,
+  swipeThreshold: 0.14,
+  confidenceThreshold: 0.45,
+})
 
 let timerId: number | undefined
+let visionTimerId: number | undefined
+let annotationId = 0
+let lastCommandAt = 0
 
 const currentSlide = computed(() => deck.value?.slides[currentIndex.value] ?? null)
 const hasDeck = computed(() => Boolean(deck.value?.slides.length))
 const filename = computed(() => deck.value?.filename || '人工智能进展与未来趋势.pptx')
 const slideCount = computed(() => deck.value?.slideCount ?? 13)
-const displayIndex = computed(() => (hasDeck.value ? currentIndex.value + 1 : 8))
+const displayIndex = computed(() => (hasDeck.value ? currentIndex.value + 1 : demoIndex.value + 1))
 const progress = computed(() => (displayIndex.value / slideCount.value) * 100)
 const conversionLabel = computed(() => {
   if (!deck.value) return '原型演示'
@@ -84,11 +164,62 @@ const modeText = computed(() => {
 const cameraStatusText = computed(() => {
   if (cameraEnabled.value) return '摄像头已开启'
   if (cameraError.value) return '摄像头模拟中'
-  return '摄像头已开启'
+  return '点击开启摄像头'
 })
 const faceStatusText = computed(() => {
+  if (!cameraEnabled.value && !cameraError.value) return '等待摄像头'
   if (cameraError.value) return '模拟人脸锁定 96%'
   return '人脸锁定 96%'
+})
+const distanceText = computed(() => {
+  const distance = visionResult.value?.face?.distanceMeters
+  return `距离 ${distance ? distance.toFixed(1) : '2.8'}m`
+})
+const gestureText = computed(() => {
+  const gesture = visionResult.value?.gesture
+  if (gesture?.action === 'next') return '右滑：下一页'
+  if (gesture?.action === 'previous') return '左滑：上一页'
+  if (gesture?.action === 'pointer') return '指向：空气指针'
+  if (!cameraEnabled.value) return '点击顶部摄像头后挥手'
+  if (activeMode.value === 'pen') return '标注模式：拖动画笔'
+  if (activeMode.value === 'zoom') return '区域放大：移动定位'
+  return '右滑：下一页'
+})
+const voiceText = computed(() => {
+  if (!voiceSupported.value) return '语音：浏览器不支持'
+  if (!voiceEnabled.value) return '语音：点击麦克风开启'
+  return `语音：${lastVoiceText.value}`
+})
+const latencyText = computed(() => {
+  if (recognitionPaused.value) return '识别已暂停'
+  return `延迟 ${visionResult.value?.latencyMs ?? 38}ms`
+})
+const faceFrameStyle = computed(() => {
+  const box = visionResult.value?.face?.box
+  if (!box) return {}
+
+  return {
+    left: `${Math.max(6, box.x * 58)}%`,
+    top: `${Math.max(8, box.y * 100)}%`,
+    width: `${Math.max(18, box.width * 58)}%`,
+    height: `${Math.max(34, box.height * 100)}%`,
+  }
+})
+const pointerStyle = computed(() => ({
+  left: `${pointerPosition.value.x * 100}%`,
+  top: `${pointerPosition.value.y * 100}%`,
+}))
+const zoomWindowStyle = computed(() => ({
+  left: `${Math.min(78, Math.max(8, zoomPoint.value.x * 100 - 11))}%`,
+  top: `${Math.min(72, Math.max(12, zoomPoint.value.y * 100 - 8))}%`,
+}))
+const zoomImageStyle = computed(() => {
+  if (!currentSlide.value) return {}
+
+  return {
+    backgroundImage: `url(${slideUrl(currentSlide.value)})`,
+    backgroundPosition: `${zoomPoint.value.x * 100}% ${zoomPoint.value.y * 100}%`,
+  }
 })
 
 const processSteps = [
@@ -188,7 +319,10 @@ function onDrop(event: DragEvent) {
 }
 
 function goToSlide(index: number) {
-  if (!deck.value) return
+  if (!deck.value) {
+    demoIndex.value = Math.min(Math.max(index, 0), slideCount.value - 1)
+    return
+  }
   currentIndex.value = Math.min(Math.max(index, 0), deck.value.slideCount - 1)
 }
 
@@ -200,13 +334,139 @@ function nextSlide() {
   goToSlide(currentIndex.value + 1)
 }
 
+function executeCommand(action: string, source: 'gesture' | 'voice' | 'button' = 'button') {
+  const now = Date.now()
+  const needsCooldown = action === 'next' || action === 'previous'
+  if (needsCooldown && now - lastCommandAt < 950) return
+  if (needsCooldown) lastCommandAt = now
+
+  if (action === 'next') nextSlide()
+  if (action === 'previous') previousSlide()
+  if (action === 'pointer') activeMode.value = 'pointer'
+  if (action === 'pen') activeMode.value = 'pen'
+  if (action === 'zoom') activeMode.value = 'zoom'
+  if (action === 'pause') recognitionPaused.value = true
+  if (action === 'resume') recognitionPaused.value = false
+  if (action === 'end') {
+    showEndConfirm.value = true
+    pendingEndByVoice.value = source === 'voice'
+  }
+  if (action === 'confirm-end') confirmEndPresentation()
+
+  if (externalControlEnabled.value && ['next', 'previous', 'start', 'end', 'pause'].includes(action)) {
+    void sendExternalControl(action)
+  }
+}
+
+async function sendExternalControl(action: string) {
+  try {
+    await fetch(`${apiBase}/api/presentation/control`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    })
+  } catch {
+    errorMessage.value = '外部 PowerPoint 控制暂不可用'
+  }
+}
+
 async function enterFullscreen() {
   if (!stageRef.value || document.fullscreenElement) return
   await stageRef.value.requestFullscreen()
 }
 
+function startVisionLoop() {
+  window.clearInterval(visionTimerId)
+  visionStatus.value = '视觉识别中'
+  visionTimerId = window.setInterval(() => {
+    void captureVisionFrame()
+  }, 180)
+}
+
+function stopVisionLoop() {
+  window.clearInterval(visionTimerId)
+  visionTimerId = undefined
+  visionStatus.value = '视觉待机'
+  visionResult.value = null
+}
+
+async function loadVisionSettings() {
+  try {
+    const response = await fetch(`${apiBase}/api/vision/settings`)
+    if (!response.ok) return
+    visionSettings.value = (await response.json()) as VisionSettings
+  } catch {
+    // Keep local defaults when backend settings are unavailable.
+  }
+}
+
+async function saveVisionSettings() {
+  try {
+    const response = await fetch(`${apiBase}/api/vision/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(visionSettings.value),
+    })
+    if (!response.ok) throw new Error('settings failed')
+    visionSettings.value = (await response.json()) as VisionSettings
+    errorMessage.value = ''
+    showSettings.value = false
+  } catch {
+    errorMessage.value = '视觉参数保存失败'
+  }
+}
+
+async function captureVisionFrame() {
+  if (recognitionPaused.value || !cameraEnabled.value || !videoRef.value || !frameCanvasRef.value) return
+  if (videoRef.value.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return
+
+  const canvas = frameCanvasRef.value
+  const context = canvas.getContext('2d')
+  if (!context) return
+
+  canvas.width = 360
+  canvas.height = 202
+  context.save()
+  context.scale(-1, 1)
+  context.drawImage(videoRef.value, -canvas.width, 0, canvas.width, canvas.height)
+  context.restore()
+
+  const data = canvas.toDataURL('image/jpeg', 0.58)
+  const startedAt = performance.now()
+  try {
+    const response = await fetch(`${apiBase}/api/vision/frame`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clientId: 'browser-main', data }),
+    })
+    if (!response.ok) throw new Error('vision request failed')
+
+    const payload = (await response.json()) as VisionResult
+    payload.latencyMs = payload.latencyMs || Math.round(performance.now() - startedAt)
+    applyVisionResult(payload)
+  } catch {
+    visionStatus.value = '视觉连接失败'
+  }
+}
+
+function applyVisionResult(payload: VisionResult) {
+  visionResult.value = payload
+  visionStatus.value = payload.status === 'detected' ? '视觉识别中' : '未检测到有效手势'
+
+  if (payload.hand?.center) {
+    pointerPosition.value = payload.hand.center
+    zoomPoint.value = payload.hand.center
+  }
+
+  const action = payload.gesture?.action
+  if (action === 'next' || action === 'previous') {
+    executeCommand(action, 'gesture')
+  }
+}
+
 async function startCamera() {
   cameraError.value = ''
+  visionStatus.value = '正在请求摄像头权限'
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { width: 640, height: 360, facingMode: 'user' },
@@ -219,9 +479,11 @@ async function startCamera() {
       videoRef.value.srcObject = stream
       await videoRef.value.play()
     }
+    startVisionLoop()
   } catch {
     cameraEnabled.value = false
     cameraError.value = '摄像头未授权'
+    visionStatus.value = '摄像头未授权，无法识别手势'
   }
 }
 
@@ -230,6 +492,7 @@ function stopCamera() {
   cameraStream.value = null
   cameraEnabled.value = false
   if (videoRef.value) videoRef.value.srcObject = null
+  stopVisionLoop()
 }
 
 function toggleCamera() {
@@ -240,11 +503,136 @@ function toggleCamera() {
   }
 }
 
-function endPresentation() {
+function toggleVoice() {
+  if (voiceEnabled.value) {
+    stopVoice()
+  } else {
+    startVoice()
+  }
+}
+
+function startVoice() {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
+  if (!Recognition) {
+    voiceSupported.value = false
+    lastVoiceText.value = '浏览器不支持语音识别'
+    return
+  }
+
+  const recognition = new Recognition()
+  recognition.lang = 'zh-CN'
+  recognition.continuous = true
+  recognition.interimResults = false
+  recognition.onresult = (event: any) => {
+    const results = Array.from(event.results ?? []) as any[]
+    const lastResult = results[results.length - 1]
+    const transcript = lastResult?.[0]?.transcript?.trim()
+    if (!transcript) return
+    lastVoiceText.value = transcript
+    handleVoiceCommand(transcript)
+  }
+  recognition.onerror = () => {
+    lastVoiceText.value = '语音识别异常'
+  }
+  recognition.onend = () => {
+    if (voiceEnabled.value) {
+      try {
+        recognition.start()
+      } catch {
+        voiceEnabled.value = false
+      }
+    }
+  }
+
+  speechRecognition.value = recognition
+  voiceEnabled.value = true
+  lastVoiceText.value = '正在聆听'
+  recognition.start()
+}
+
+function stopVoice() {
+  voiceEnabled.value = false
+  speechRecognition.value?.stop()
+  speechRecognition.value = null
+  lastVoiceText.value = '等待语音'
+}
+
+function handleVoiceCommand(text: string) {
+  const command = text.replace(/\s/g, '')
+  if (showEndConfirm.value && (command.includes('确认结束') || command.includes('确认'))) {
+    executeCommand('confirm-end', 'voice')
+    return
+  }
+  if (command.includes('下一页') || command.includes('下页')) executeCommand('next', 'voice')
+  if (command.includes('上一页') || command.includes('上页')) executeCommand('previous', 'voice')
+  if (command.includes('空气指针') || command.includes('打开指针') || command.includes('指针')) executeCommand('pointer', 'voice')
+  if (command.includes('标注') || command.includes('画笔')) executeCommand('pen', 'voice')
+  if (command.includes('放大') || command.includes('区域')) executeCommand('zoom', 'voice')
+  if (command.includes('暂停')) executeCommand('pause', 'voice')
+  if (command.includes('继续')) executeCommand('resume', 'voice')
+  if (command.includes('结束演示') || command.includes('结束放映')) executeCommand('end', 'voice')
+}
+
+function stagePoint(event: PointerEvent): Point {
+  const rect = stageRef.value?.getBoundingClientRect()
+  if (!rect) return { x: 0.5, y: 0.5 }
+  return {
+    x: Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)),
+    y: Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)),
+  }
+}
+
+function pointList(points: Point[]) {
+  return points.map((point) => `${point.x * 100},${point.y * 100}`).join(' ')
+}
+
+function handleStagePointerMove(event: PointerEvent) {
+  if (activeMode.value === 'zoom') {
+    zoomPoint.value = stagePoint(event)
+  }
+}
+
+function startAnnotation(event: PointerEvent) {
+  if (activeMode.value !== 'pen') return
+  const target = event.currentTarget as HTMLElement
+  target.setPointerCapture?.(event.pointerId)
+  const line = { id: annotationId++, points: [stagePoint(event)] }
+  drawingLine.value = line
+  annotations.value.push(line)
+}
+
+function moveAnnotation(event: PointerEvent) {
+  if (activeMode.value !== 'pen' || !drawingLine.value) return
+  drawingLine.value.points.push(stagePoint(event))
+}
+
+function stopAnnotation(event: PointerEvent) {
+  const target = event.currentTarget as HTMLElement
+  target.releasePointerCapture?.(event.pointerId)
+  drawingLine.value = null
+}
+
+function clearAnnotations() {
+  annotations.value = []
+}
+
+function requestEndPresentation() {
+  showEndConfirm.value = true
+}
+
+function confirmEndPresentation() {
   deck.value = null
   currentIndex.value = 0
   activeMode.value = 'pointer'
   recognitionPaused.value = false
+  annotations.value = []
+  showEndConfirm.value = false
+  pendingEndByVoice.value = false
+}
+
+function cancelEndPresentation() {
+  showEndConfirm.value = false
+  pendingEndByVoice.value = false
 }
 
 function handleKeydown(event: KeyboardEvent) {
@@ -275,6 +663,7 @@ function handleKeydown(event: KeyboardEvent) {
 
 onMounted(() => {
   window.addEventListener('keydown', handleKeydown)
+  void loadVisionSettings()
   timerId = window.setInterval(() => {
     if (!recognitionPaused.value) elapsedSeconds.value += 1
   }, 1000)
@@ -283,6 +672,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
   if (timerId) window.clearInterval(timerId)
+  stopVoice()
   stopCamera()
 })
 </script>
@@ -296,6 +686,7 @@ onBeforeUnmount(() => {
       accept=".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation"
       @change="onFileChange"
     />
+    <canvas ref="frameCanvasRef" class="sr-only" aria-hidden="true"></canvas>
 
     <header class="top-bar">
       <section class="brand-zone">
@@ -320,7 +711,7 @@ onBeforeUnmount(() => {
       </button>
 
       <section class="device-zone">
-        <button class="icon-status" type="button" title="麦克风状态">
+        <button class="icon-status" :class="{ active: voiceEnabled }" type="button" title="语音控制" @click="toggleVoice">
           <Mic :size="22" />
           <span class="level-bars"><i></i><i></i><i></i></span>
         </button>
@@ -330,7 +721,7 @@ onBeforeUnmount(() => {
           <span>{{ cameraStatusText }}</span>
         </button>
         <div class="divider"></div>
-        <button class="settings-button" type="button">
+        <button class="settings-button" type="button" @click="showSettings = true">
           <Settings :size="22" />
           <span>设置</span>
         </button>
@@ -356,6 +747,7 @@ onBeforeUnmount(() => {
         @dragover.prevent="isDragging = true"
         @dragleave.prevent="isDragging = false"
         @drop="onDrop"
+        @pointermove="handleStagePointerMove"
       >
         <template v-if="currentSlide">
           <img class="real-slide" :src="slideUrl(currentSlide)" :alt="`PPT 第 ${currentSlide.index} 页`" />
@@ -402,6 +794,35 @@ onBeforeUnmount(() => {
           </section>
         </template>
 
+        <svg
+          class="annotation-layer"
+          :class="{ drawable: activeMode === 'pen' }"
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          @pointerdown="startAnnotation"
+          @pointermove="moveAnnotation"
+          @pointerup="stopAnnotation"
+          @pointerleave="stopAnnotation"
+        >
+          <polyline
+            v-for="line in annotations"
+            :key="line.id"
+            :points="pointList(line.points)"
+            vector-effect="non-scaling-stroke"
+          />
+        </svg>
+
+        <div v-if="activeMode === 'pointer'" class="air-pointer" :style="pointerStyle">
+          <span></span>
+        </div>
+
+        <div v-if="activeMode === 'zoom'" class="zoom-window" :style="zoomWindowStyle">
+          <div class="zoom-surface" :style="zoomImageStyle">
+            <span v-if="!currentSlide">区域放大</span>
+          </div>
+          <b>2.2x</b>
+        </div>
+
         <aside class="camera-preview">
           <span class="camera-dot"></span>
           <video v-show="cameraEnabled" ref="videoRef" muted playsinline></video>
@@ -415,26 +836,27 @@ onBeforeUnmount(() => {
             <span class="eye eye-right"></span>
             <span class="mouth"></span>
           </div>
-          <div class="face-frame"></div>
+          <div class="face-frame" :style="faceFrameStyle"></div>
           <div class="camera-copy">
             <strong>{{ faceStatusText }}</strong>
-            <span>距离 2.8m</span>
+            <span>{{ distanceText }}</span>
           </div>
         </aside>
 
         <aside class="assist-card">
           <p>
             <Hand :size="23" />
-            <span>右滑：下一页</span>
+            <span>{{ gestureText }}</span>
           </p>
           <p>
             <Mic :size="23" />
-            <span>语音：放大此区域</span>
+            <span>{{ voiceText }}</span>
           </p>
           <p>
             <i></i>
-            <span>{{ recognitionPaused ? '识别已暂停' : '延迟 38ms' }}</span>
+            <span>{{ latencyText }}</span>
           </p>
+          <small>{{ visionStatus }} · {{ modeText }}</small>
         </aside>
 
         <button v-if="!hasDeck" class="quick-upload" type="button" @click="pickFile">
@@ -463,24 +885,24 @@ onBeforeUnmount(() => {
       </button>
 
       <nav class="tool-strip">
-        <button class="tool-button" type="button" :disabled="!hasDeck || currentIndex === 0" @click="previousSlide">
+        <button class="tool-button" type="button" :disabled="hasDeck ? currentIndex === 0 : demoIndex === 0" @click="previousSlide">
           <ArrowLeft :size="34" />
           <span>上一页</span>
         </button>
         <button
           class="tool-button"
           type="button"
-          :disabled="!hasDeck || currentIndex >= (deck?.slideCount ?? 1) - 1"
+          :disabled="hasDeck ? currentIndex >= (deck?.slideCount ?? 1) - 1 : demoIndex >= slideCount - 1"
           @click="nextSlide"
         >
           <ArrowRight :size="34" />
           <span>下一页</span>
         </button>
-        <button class="tool-button active" type="button" @click="activeMode = 'pointer'">
+        <button class="tool-button" :class="{ active: activeMode === 'pointer' }" type="button" @click="activeMode = 'pointer'">
           <Hand :size="33" />
           <span>空气指针</span>
         </button>
-        <button class="tool-button" :class="{ selected: activeMode === 'pen' }" type="button" @click="activeMode = 'pen'">
+        <button class="tool-button" :class="{ selected: activeMode === 'pen' }" type="button" @click="activeMode = 'pen'" @dblclick="clearAnnotations">
           <PenLine :size="32" />
           <span>标注</span>
         </button>
@@ -492,7 +914,7 @@ onBeforeUnmount(() => {
           <Pause :size="34" />
           <span>{{ recognitionPaused ? '继续识别' : '暂停识别' }}</span>
         </button>
-        <button class="tool-button danger" type="button" @click="endPresentation">
+        <button class="tool-button danger" type="button" @click="requestEndPresentation">
           <Square :size="25" />
           <span>结束演示</span>
         </button>
@@ -504,6 +926,72 @@ onBeforeUnmount(() => {
         <button type="button" @click="enterFullscreen">全屏</button>
       </div>
     </footer>
+
+    <section v-if="showEndConfirm" class="confirm-layer">
+      <article class="confirm-dialog">
+        <h2>确认结束演示？</h2>
+        <p>为避免误操作，请点击确认按钮，或开启语音后说“确认结束”。</p>
+        <div class="confirm-checks">
+          <span :class="{ ok: !pendingEndByVoice }">手动确认已就绪</span>
+          <span :class="{ ok: voiceEnabled }">语音确认{{ voiceEnabled ? '可用' : '未开启' }}</span>
+        </div>
+        <div class="confirm-actions">
+          <button type="button" @click="cancelEndPresentation">继续演示</button>
+          <button class="danger" type="button" @click="confirmEndPresentation">确认结束</button>
+        </div>
+      </article>
+    </section>
+
+    <section v-if="showSettings" class="confirm-layer">
+      <article class="settings-dialog">
+        <header>
+          <h2>交互设置</h2>
+          <button type="button" @click="showSettings = false">
+            <X :size="20" />
+          </button>
+        </header>
+
+        <label class="setting-row">
+          <span>
+            手势冷却时间
+            <small>降低连续误触发，参考开源项目的 cooldown 设计</small>
+          </span>
+          <input v-model.number="visionSettings.cooldownSeconds" min="0.4" max="5" step="0.1" type="range" />
+          <b>{{ visionSettings.cooldownSeconds.toFixed(1) }}s</b>
+        </label>
+
+        <label class="setting-row">
+          <span>
+            滑动触发阈值
+            <small>数值越小越灵敏，越大越稳定</small>
+          </span>
+          <input v-model.number="visionSettings.swipeThreshold" min="0.08" max="0.5" step="0.01" type="range" />
+          <b>{{ visionSettings.swipeThreshold.toFixed(2) }}</b>
+        </label>
+
+        <label class="setting-row">
+          <span>
+            识别置信阈值
+            <small>过滤较小或不稳定的手部区域</small>
+          </span>
+          <input v-model.number="visionSettings.confidenceThreshold" min="0.2" max="0.95" step="0.01" type="range" />
+          <b>{{ visionSettings.confidenceThreshold.toFixed(2) }}</b>
+        </label>
+
+        <label class="toggle-row">
+          <span>
+            控制外部 PowerPoint
+            <small>开启后会通过 Python 调用 PowerPoint COM，失败时用系统按键兜底</small>
+          </span>
+          <input v-model="externalControlEnabled" type="checkbox" />
+        </label>
+
+        <footer>
+          <button type="button" @click="showSettings = false">取消</button>
+          <button class="primary" type="button" @click="saveVisionSettings">保存设置</button>
+        </footer>
+      </article>
+    </section>
   </main>
 </template>
 
@@ -661,6 +1149,10 @@ onBeforeUnmount(() => {
   cursor: pointer;
 }
 
+.icon-status.active {
+  color: #18e193;
+}
+
 .level-bars {
   display: flex;
   align-items: flex-end;
@@ -728,6 +1220,94 @@ onBeforeUnmount(() => {
   height: 100%;
   object-fit: contain;
   background: white;
+}
+
+.annotation-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.annotation-layer.drawable {
+  cursor: crosshair;
+  pointer-events: auto;
+}
+
+.annotation-layer polyline {
+  fill: none;
+  stroke: #13d59d;
+  stroke-width: 5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 4px 8px rgb(19 213 157 / 0.28));
+}
+
+.air-pointer {
+  position: absolute;
+  z-index: 5;
+  width: 26px;
+  height: 26px;
+  transform: translate(-50%, -50%);
+  border: 3px solid white;
+  border-radius: 999px;
+  background: rgb(43 132 255 / 0.9);
+  box-shadow:
+    0 0 0 9px rgb(43 132 255 / 0.16),
+    0 10px 26px rgb(23 84 170 / 0.36);
+  pointer-events: none;
+}
+
+.air-pointer span {
+  position: absolute;
+  left: 19px;
+  top: 19px;
+  width: 92px;
+  height: 3px;
+  transform: rotate(28deg);
+  transform-origin: left center;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgb(43 132 255 / 0.7), transparent);
+}
+
+.zoom-window {
+  position: absolute;
+  z-index: 6;
+  width: 252px;
+  height: 158px;
+  overflow: hidden;
+  border: 2px solid rgb(43 132 255 / 0.95);
+  border-radius: 10px;
+  background: rgb(243 248 255 / 0.96);
+  box-shadow: 0 24px 54px rgb(21 67 140 / 0.26);
+  pointer-events: none;
+}
+
+.zoom-surface {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  background:
+    linear-gradient(rgb(255 255 255 / 0.08), rgb(255 255 255 / 0.08)),
+    radial-gradient(circle at 50% 50%, #ffffff, #ddecff);
+  background-repeat: no-repeat;
+  background-size: 230% 230%;
+  color: #1e67d8;
+  font-weight: 800;
+}
+
+.zoom-window b {
+  position: absolute;
+  right: 8px;
+  bottom: 7px;
+  border-radius: 999px;
+  background: rgb(16 40 76 / 0.7);
+  color: white;
+  padding: 3px 8px;
+  font-size: 12px;
 }
 
 .demo-slide {
@@ -1112,6 +1692,14 @@ onBeforeUnmount(() => {
   margin-top: 18px;
 }
 
+.assist-card small {
+  display: block;
+  margin-top: 18px;
+  color: rgb(255 255 255 / 0.7);
+  font-size: 13px;
+  font-weight: 500;
+}
+
 .quick-upload {
   position: absolute;
   left: 50%;
@@ -1258,6 +1846,183 @@ onBeforeUnmount(() => {
 
 .footer-meta {
   display: none;
+}
+
+.confirm-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: rgb(3 10 20 / 0.58);
+  backdrop-filter: blur(7px);
+}
+
+.confirm-dialog {
+  width: min(460px, calc(100vw - 32px));
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgb(18 32 52 / 0.98), rgb(12 21 36 / 0.98));
+  box-shadow: 0 28px 80px rgb(0 0 0 / 0.42);
+  padding: 28px;
+}
+
+.settings-dialog {
+  width: min(620px, calc(100vw - 32px));
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgb(18 32 52 / 0.98), rgb(12 21 36 / 0.98));
+  box-shadow: 0 28px 80px rgb(0 0 0 / 0.42);
+  padding: 24px;
+}
+
+.settings-dialog header,
+.settings-dialog footer,
+.setting-row,
+.toggle-row {
+  display: flex;
+  align-items: center;
+}
+
+.settings-dialog header {
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.settings-dialog h2 {
+  margin: 0;
+  color: white;
+  font-size: 24px;
+}
+
+.settings-dialog header button {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  background: rgb(255 255 255 / 0.07);
+  color: white;
+  cursor: pointer;
+}
+
+.setting-row,
+.toggle-row {
+  gap: 18px;
+  border-top: 1px solid rgb(255 255 255 / 0.08);
+  padding: 18px 0;
+}
+
+.setting-row > span,
+.toggle-row > span {
+  flex: 1;
+  color: #eef5ff;
+  font-weight: 800;
+}
+
+.setting-row small,
+.toggle-row small {
+  display: block;
+  margin-top: 6px;
+  color: #9eacc2;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.setting-row input[type='range'] {
+  width: 190px;
+  accent-color: #2d91ff;
+}
+
+.setting-row b {
+  width: 56px;
+  color: #8ebcff;
+  text-align: right;
+}
+
+.toggle-row input {
+  width: 20px;
+  height: 20px;
+  accent-color: #18e193;
+}
+
+.settings-dialog footer {
+  justify-content: flex-end;
+  gap: 12px;
+  border-top: 1px solid rgb(255 255 255 / 0.08);
+  padding-top: 18px;
+}
+
+.settings-dialog footer button {
+  height: 40px;
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-radius: 8px;
+  background: rgb(255 255 255 / 0.08);
+  color: white;
+  padding: 0 16px;
+  cursor: pointer;
+}
+
+.settings-dialog footer button.primary {
+  border-color: rgb(45 145 255 / 0.38);
+  background: rgb(45 145 255 / 0.18);
+  color: #b9d6ff;
+  font-weight: 800;
+}
+
+.confirm-dialog h2 {
+  margin: 0;
+  color: white;
+  font-size: 24px;
+}
+
+.confirm-dialog p {
+  margin: 12px 0 0;
+  color: #becbe0;
+  line-height: 1.75;
+}
+
+.confirm-checks {
+  display: grid;
+  gap: 10px;
+  margin: 22px 0;
+}
+
+.confirm-checks span {
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-radius: 8px;
+  background: rgb(255 255 255 / 0.05);
+  color: #c8d4e7;
+  padding: 10px 12px;
+}
+
+.confirm-checks span.ok {
+  border-color: rgb(32 231 147 / 0.35);
+  color: #8df1c8;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+.confirm-actions button {
+  height: 40px;
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-radius: 8px;
+  background: rgb(255 255 255 / 0.08);
+  color: white;
+  padding: 0 16px;
+  cursor: pointer;
+}
+
+.confirm-actions button.danger {
+  border-color: rgb(255 93 103 / 0.42);
+  background: rgb(255 93 103 / 0.16);
+  color: #ff8c92;
+  font-weight: 800;
 }
 
 @media (max-width: 1400px) {

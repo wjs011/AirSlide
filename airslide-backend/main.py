@@ -5,18 +5,21 @@ import platform
 import re
 import shutil
 import textwrap
+import time
 import uuid
 import zipfile
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Optional, Tuple
 from xml.etree import ElementTree
 
 import socketio
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 
@@ -33,28 +36,280 @@ PRESENTATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 @dataclass
 class VisionResult:
-    face_center: Optional[Tuple[int, int]] = None
-    gesture: Optional[str] = None
+    face: Optional[Dict[str, Any]] = None
+    hand: Optional[Dict[str, Any]] = None
+    gesture: Optional[Dict[str, Any]] = None
+    status: str = "no-signal"
+    latency_ms: int = 0
+
+
+class VisionFramePayload(BaseModel):
+    data: str
+    clientId: str = "default"
+
+
+class ControlCommandPayload(BaseModel):
+    action: str
+
+
+class VisionSettingsPayload(BaseModel):
+    cooldownSeconds: Optional[float] = None
+    swipeThreshold: Optional[float] = None
+    confidenceThreshold: Optional[float] = None
 
 
 class VisionManager:
     def __init__(self) -> None:
-        # Reserved for future camera/gesture work.
         self._lock = asyncio.Lock()
+        self._histories: Dict[str, Deque[Tuple[float, float, float]]] = defaultdict(
+            lambda: deque(maxlen=12)
+        )
+        self._previous_frames: Dict[str, Any] = {}
+        self._last_action_at: Dict[str, float] = defaultdict(float)
+        self._opencv_error: Optional[str] = None
+        self.cooldown_seconds = 1.25
+        self.swipe_threshold = 0.14
+        self.confidence_threshold = 0.45
 
-    async def detect_face(self, frame: bytes) -> Optional[Tuple[int, int]]:
-        await asyncio.sleep(0)
-        return None
+        try:
+            import cv2
+            import numpy as np
 
-    async def recognize_gesture(self, frame: bytes) -> Optional[str]:
-        await asyncio.sleep(0)
-        return None
+            self.cv2 = cv2
+            self.np = np
+            cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+            self.face_cascade = cv2.CascadeClassifier(str(cascade_path))
+        except Exception as exc:
+            self.cv2 = None
+            self.np = None
+            self.face_cascade = None
+            self._opencv_error = str(exc)
 
-    async def process_frame(self, frame: bytes) -> VisionResult:
+    def _empty_result(self, started_at: float, status: str = "no-signal") -> VisionResult:
+        return VisionResult(status=status, latency_ms=int((time.perf_counter() - started_at) * 1000))
+
+    def _decode_image(self, frame: bytes) -> Optional[Any]:
+        if self.cv2 is None or self.np is None:
+            return None
+
+        buffer = self.np.frombuffer(frame, dtype=self.np.uint8)
+        image = self.cv2.imdecode(buffer, self.cv2.IMREAD_COLOR)
+        return image
+
+    def _detect_face(self, image: Any) -> Optional[Dict[str, Any]]:
+        if self.cv2 is None or self.face_cascade is None or self.face_cascade.empty():
+            return None
+
+        height, width = image.shape[:2]
+        gray = self.cv2.cvtColor(image, self.cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=4)
+        if len(faces) == 0:
+            return None
+
+        x, y, w, h = max(faces, key=lambda item: item[2] * item[3])
+        face_width_ratio = max(w / width, 0.01)
+        distance_meters = max(0.7, min(4.8, 0.55 / face_width_ratio))
+
+        return {
+            "box": {
+                "x": round(x / width, 4),
+                "y": round(y / height, 4),
+                "width": round(w / width, 4),
+                "height": round(h / height, 4),
+            },
+            "center": {
+                "x": round((x + w / 2) / width, 4),
+                "y": round((y + h / 2) / height, 4),
+            },
+            "confidence": 0.86,
+            "distanceMeters": round(distance_meters, 1),
+        }
+
+    def _detect_hand(self, image: Any, face: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if self.cv2 is None or self.np is None:
+            return None
+
+        height, width = image.shape[:2]
+        blurred = self.cv2.GaussianBlur(image, (5, 5), 0)
+        ycrcb = self.cv2.cvtColor(blurred, self.cv2.COLOR_BGR2YCrCb)
+        lower = self.np.array([0, 133, 77], dtype=self.np.uint8)
+        upper = self.np.array([255, 173, 127], dtype=self.np.uint8)
+        mask = self.cv2.inRange(ycrcb, lower, upper)
+
+        if face is not None:
+            box = face["box"]
+            x1 = max(int((box["x"] - 0.04) * width), 0)
+            y1 = max(int((box["y"] - 0.08) * height), 0)
+            x2 = min(int((box["x"] + box["width"] + 0.04) * width), width)
+            y2 = min(int((box["y"] + box["height"] + 0.08) * height), height)
+            mask[y1:y2, x1:x2] = 0
+
+        kernel = self.np.ones((5, 5), self.np.uint8)
+        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_CLOSE, kernel, iterations=2)
+        contours, _ = self.cv2.findContours(mask, self.cv2.RETR_EXTERNAL, self.cv2.CHAIN_APPROX_SIMPLE)
+        min_area = width * height * max(0.003, self.confidence_threshold * 0.012)
+        candidates = [contour for contour in contours if self.cv2.contourArea(contour) > min_area]
+        if not candidates:
+            return None
+
+        contour = max(candidates, key=self.cv2.contourArea)
+        x, y, w, h = self.cv2.boundingRect(contour)
+        moments = self.cv2.moments(contour)
+        if moments["m00"] == 0:
+            center_x = x + w / 2
+            center_y = y + h / 2
+        else:
+            center_x = moments["m10"] / moments["m00"]
+            center_y = moments["m01"] / moments["m00"]
+
+        hull = self.cv2.convexHull(contour)
+        hull_area = max(self.cv2.contourArea(hull), 1)
+        contour_area = self.cv2.contourArea(contour)
+        fill_ratio = contour_area / hull_area
+        pose = "open_hand" if fill_ratio < 0.82 or w > h * 0.75 else "pointing"
+
+        return {
+            "center": {"x": round(center_x / width, 4), "y": round(center_y / height, 4)},
+            "box": {
+                "x": round(x / width, 4),
+                "y": round(y / height, 4),
+                "width": round(w / width, 4),
+                "height": round(h / height, 4),
+            },
+            "pose": pose,
+            "confidence": round(min(0.96, max(0.45, contour_area / (width * height * 0.05))), 2),
+        }
+
+    def _detect_motion_hand(
+        self,
+        client_id: str,
+        image: Any,
+        face: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if self.cv2 is None or self.np is None:
+            return None
+
+        height, width = image.shape[:2]
+        gray = self.cv2.cvtColor(image, self.cv2.COLOR_BGR2GRAY)
+        gray = self.cv2.GaussianBlur(gray, (15, 15), 0)
+        previous = self._previous_frames.get(client_id)
+        self._previous_frames[client_id] = gray
+        if previous is None:
+            return None
+
+        diff = self.cv2.absdiff(previous, gray)
+        _, mask = self.cv2.threshold(diff, 18, 255, self.cv2.THRESH_BINARY)
+        kernel = self.np.ones((9, 9), self.np.uint8)
+        mask = self.cv2.dilate(mask, kernel, iterations=2)
+        mask = self.cv2.morphologyEx(mask, self.cv2.MORPH_CLOSE, kernel, iterations=1)
+
+        if face is not None:
+            box = face["box"]
+            x1 = max(int((box["x"] - 0.08) * width), 0)
+            y1 = max(int((box["y"] - 0.12) * height), 0)
+            x2 = min(int((box["x"] + box["width"] + 0.08) * width), width)
+            y2 = min(int((box["y"] + box["height"] + 0.12) * height), height)
+            mask[y1:y2, x1:x2] = 0
+
+        contours, _ = self.cv2.findContours(mask, self.cv2.RETR_EXTERNAL, self.cv2.CHAIN_APPROX_SIMPLE)
+        min_area = width * height * 0.01
+        candidates = [contour for contour in contours if self.cv2.contourArea(contour) > min_area]
+        if not candidates:
+            return None
+
+        contour = max(candidates, key=self.cv2.contourArea)
+        x, y, w, h = self.cv2.boundingRect(contour)
+        moments = self.cv2.moments(contour)
+        if moments["m00"] == 0:
+            center_x = x + w / 2
+            center_y = y + h / 2
+        else:
+            center_x = moments["m10"] / moments["m00"]
+            center_y = moments["m01"] / moments["m00"]
+
+        contour_area = self.cv2.contourArea(contour)
+        return {
+            "center": {"x": round(center_x / width, 4), "y": round(center_y / height, 4)},
+            "box": {
+                "x": round(x / width, 4),
+                "y": round(y / height, 4),
+                "width": round(w / width, 4),
+                "height": round(h / height, 4),
+            },
+            "pose": "motion",
+            "confidence": round(min(0.92, max(0.5, contour_area / (width * height * 0.08))), 2),
+        }
+
+    def _classify_motion(self, client_id: str, hand: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if hand is None:
+            return None
+
+        now = time.perf_counter()
+        center = hand["center"]
+        history = self._histories[client_id]
+        history.append((now, center["x"], center["y"]))
+
+        action: Optional[str] = None
+        if len(history) >= 4:
+            first_time, first_x, first_y = history[0]
+            last_time, last_x, last_y = history[-1]
+            dx = last_x - first_x
+            dy = abs(last_y - first_y)
+            duration = max(last_time - first_time, 0.001)
+            cooldown_ready = now - self._last_action_at[client_id] > self.cooldown_seconds
+
+            if 0.12 <= duration <= 2.4 and abs(dx) > self.swipe_threshold and dy < 0.32 and cooldown_ready:
+                action = "next" if dx > 0 else "previous"
+                self._last_action_at[client_id] = now
+                history.clear()
+
+        gesture_name = "右滑" if action == "next" else "左滑" if action == "previous" else hand["pose"]
+        return {
+            "name": gesture_name,
+            "action": action or ("pointer" if hand["pose"] in {"pointing", "motion"} else "open_hand"),
+            "confidence": hand["confidence"],
+        }
+
+    async def process_frame(self, frame: bytes, client_id: str = "default") -> VisionResult:
+        started_at = time.perf_counter()
         async with self._lock:
-            face_center = await self.detect_face(frame)
-            gesture = await self.recognize_gesture(frame)
-            return VisionResult(face_center=face_center, gesture=gesture)
+            image = self._decode_image(frame)
+            if image is None:
+                return self._empty_result(started_at, "opencv-unavailable")
+
+            face = self._detect_face(image)
+            skin_hand = self._detect_hand(image, face)
+            motion_hand = self._detect_motion_hand(client_id, image, face)
+            if skin_hand is not None and motion_hand is not None:
+                hand = skin_hand if skin_hand["confidence"] >= motion_hand["confidence"] + 0.12 else motion_hand
+            else:
+                hand = skin_hand or motion_hand
+            gesture = self._classify_motion(client_id, hand)
+            status = "detected" if face or hand else "no-signal"
+            return VisionResult(
+                face=face,
+                hand=hand,
+                gesture=gesture,
+                status=status,
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+            )
+
+    def update_settings(self, settings: VisionSettingsPayload) -> Dict[str, float]:
+        if settings.cooldownSeconds is not None:
+            self.cooldown_seconds = min(5.0, max(0.4, settings.cooldownSeconds))
+        if settings.swipeThreshold is not None:
+            self.swipe_threshold = min(0.5, max(0.08, settings.swipeThreshold))
+        if settings.confidenceThreshold is not None:
+            self.confidence_threshold = min(0.95, max(0.2, settings.confidenceThreshold))
+        return self.settings()
+
+    def settings(self) -> Dict[str, float]:
+        return {
+            "cooldownSeconds": self.cooldown_seconds,
+            "swipeThreshold": self.swipe_threshold,
+            "confidenceThreshold": self.confidence_threshold,
+        }
 
 
 app = FastAPI(title="AirSlide Backend")
@@ -69,6 +324,73 @@ app.mount("/media", StaticFiles(directory=STORAGE_DIR), name="media")
 
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 vision_manager = VisionManager()
+
+
+class PresentationController:
+    def __init__(self) -> None:
+        self._powerpoint = None
+
+    def _connect_powerpoint(self) -> bool:
+        if platform.system() != "Windows":
+            return False
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            self._powerpoint = win32com.client.GetActiveObject("PowerPoint.Application")
+            return True
+        except Exception:
+            self._powerpoint = None
+            return False
+
+    def _send_key(self, key: str) -> bool:
+        if platform.system() != "Windows":
+            return False
+        try:
+            import win32com.client
+
+            shell = win32com.client.Dispatch("WScript.Shell")
+            shell.SendKeys(key)
+            return True
+        except Exception:
+            return False
+
+    def execute(self, action: str) -> Dict[str, Any]:
+        action = action.lower().strip()
+        if action not in {"next", "previous", "start", "end", "pause"}:
+            raise ValueError("Unsupported presentation action")
+
+        method = "keyboard"
+        powerpoint_ok = self._connect_powerpoint()
+        if powerpoint_ok and self._powerpoint is not None:
+            try:
+                if action == "next":
+                    self._powerpoint.ActivePresentation.SlideShowWindow.View.Next()
+                elif action == "previous":
+                    self._powerpoint.ActivePresentation.SlideShowWindow.View.Previous()
+                elif action == "start":
+                    self._powerpoint.ActivePresentation.SlideShowSettings.Run()
+                elif action == "end":
+                    self._powerpoint.ActivePresentation.SlideShowWindow.View.Exit()
+                elif action == "pause":
+                    self._send_key(" ")
+                return {"action": action, "executed": True, "method": "powerpoint-com"}
+            except Exception:
+                method = "keyboard-fallback"
+
+        key_map = {
+            "next": "{RIGHT}",
+            "previous": "{LEFT}",
+            "start": "{F5}",
+            "end": "{ESC}",
+            "pause": " ",
+        }
+        executed = self._send_key(key_map[action])
+        return {"action": action, "executed": executed, "method": method}
+
+
+presentation_controller = PresentationController()
 
 
 def _safe_filename(filename: str) -> str:
@@ -316,6 +638,40 @@ async def get_presentation(presentation_id: str) -> dict[str, Any]:
     return json.loads(manifest_path.read_text(encoding="utf-8"))
 
 
+@app.post("/api/vision/frame")
+async def process_vision_frame(payload: VisionFramePayload) -> dict[str, Any]:
+    frame = _decode_frame(payload.data)
+    if frame is None:
+        raise HTTPException(status_code=400, detail="视频帧格式无效")
+
+    result = await vision_manager.process_frame(frame, payload.clientId)
+    return {
+        "status": result.status,
+        "face": result.face,
+        "hand": result.hand,
+        "gesture": result.gesture,
+        "latencyMs": result.latency_ms,
+    }
+
+
+@app.get("/api/vision/settings")
+async def get_vision_settings() -> Dict[str, float]:
+    return vision_manager.settings()
+
+
+@app.post("/api/vision/settings")
+async def update_vision_settings(payload: VisionSettingsPayload) -> Dict[str, float]:
+    return vision_manager.update_settings(payload)
+
+
+@app.post("/api/presentation/control")
+async def control_presentation(payload: ControlCommandPayload) -> Dict[str, Any]:
+    try:
+        return presentation_controller.execute(payload.action)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @sio.event
 async def connect(sid: str, environ: Dict[str, Any]) -> None:
     await sio.emit("status", {"event": "connection", "status": "connected"}, to=sid)
@@ -365,17 +721,17 @@ async def video_frame(sid: str, data: Any) -> None:
     result = await _run_vision_pipeline(frame)
     payload: Dict[str, Any] = {}
 
-    if result.face_center is not None:
-        payload["face"] = {
-            "event": "face",
-            "center": {"x": result.face_center[0], "y": result.face_center[1]},
-        }
+    if result.face is not None:
+        payload["face"] = {"event": "face", **result.face}
+
+    if result.hand is not None:
+        payload["hand"] = {"event": "hand", **result.hand}
 
     if result.gesture is not None:
-        payload["gesture"] = {"event": "gesture", "action": result.gesture}
+        payload["gesture"] = {"event": "gesture", **result.gesture}
 
     if not payload:
-        payload = {"event": "status", "message": "no-signal"}
+        payload = {"event": "status", "message": result.status}
 
     await sio.emit("result", payload, to=sid)
 
