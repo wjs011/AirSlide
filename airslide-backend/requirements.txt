@@ -3,3 +3,4 @@ uvicorn[standard]==0.30.6
 python-socketio==5.11.4
 python-multipart==0.0.12
 pywin32==306; platform_system == "Windows"
+opencv-python==4.11.0.86
