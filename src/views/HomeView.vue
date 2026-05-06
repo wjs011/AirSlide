@@ -65,11 +65,26 @@ type VisionResult = {
     box: { x: number; y: number; width: number; height: number }
     pose: string
     confidence: number
+    source?: string
+    fingers?: Record<string, boolean>
   } | null
   gesture?: {
     name: string
     action: 'next' | 'previous' | 'pointer' | 'open_hand'
     confidence: number
+  } | null
+  debug?: {
+    mediapipeAvailable?: boolean
+    mediapipeError?: string | null
+    opencvAvailable?: boolean
+    opencvError?: string | null
+    handSource?: string | null
+    pageTurnCooldownSeconds?: number
+    pageTurnPoseMatched?: boolean
+    pageTurnHoldProgress?: number
+    pageTurnHoldSeconds?: number
+    pageTurnArmed?: boolean
+    pageTurnCooldownRemaining?: number
   } | null
 }
 
@@ -102,6 +117,7 @@ const apiBase = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 const fileInput = ref<HTMLInputElement | null>(null)
 const stageRef = ref<HTMLElement | null>(null)
 const videoRef = ref<HTMLVideoElement | null>(null)
+const debugVideoRef = ref<HTMLVideoElement | null>(null)
 const frameCanvasRef = ref<HTMLCanvasElement | null>(null)
 const cameraStream = ref<MediaStream | null>(null)
 const deck = ref<PresentationManifest | null>(null)
@@ -130,7 +146,7 @@ const pendingEndByVoice = ref(false)
 const showSettings = ref(false)
 const externalControlEnabled = ref(false)
 const visionSettings = ref<VisionSettings>({
-  cooldownSeconds: 1.25,
+  cooldownSeconds: 5,
   swipeThreshold: 0.14,
   confidenceThreshold: 0.45,
 })
@@ -177,13 +193,14 @@ const distanceText = computed(() => {
 })
 const gestureText = computed(() => {
   const gesture = visionResult.value?.gesture
-  if (gesture?.action === 'next') return '右滑：下一页'
-  if (gesture?.action === 'previous') return '左滑：上一页'
+  if (gesture?.action === 'next') return '激活手势挥动：下一页'
+  if (visionResult.value?.debug?.pageTurnArmed) return '翻页模式已激活：挥手下一页'
+  if (visionResult.value?.debug?.pageTurnPoseMatched) return '保持 1 秒后进入翻页模式'
   if (gesture?.action === 'pointer') return '指向：空气指针'
-  if (!cameraEnabled.value) return '点击顶部摄像头后挥手'
+  if (!cameraEnabled.value) return '点击顶部摄像头后识别手势'
   if (activeMode.value === 'pen') return '标注模式：拖动画笔'
   if (activeMode.value === 'zoom') return '区域放大：移动定位'
-  return '右滑：下一页'
+  return '食指中指伸出、无名指小指收起，保持 1 秒后挥手翻页'
 })
 const voiceText = computed(() => {
   if (!voiceSupported.value) return '语音：浏览器不支持'
@@ -220,6 +237,59 @@ const zoomImageStyle = computed(() => {
     backgroundImage: `url(${slideUrl(currentSlide.value)})`,
     backgroundPosition: `${zoomPoint.value.x * 100}% ${zoomPoint.value.y * 100}%`,
   }
+})
+const handFrameStyle = computed(() => {
+  const box = visionResult.value?.hand?.box
+  if (!box) return {}
+
+  return {
+    left: `${box.x * 100}%`,
+    top: `${box.y * 100}%`,
+    width: `${box.width * 100}%`,
+    height: `${box.height * 100}%`,
+  }
+})
+const handCenterStyle = computed(() => {
+  const center = visionResult.value?.hand?.center
+  if (!center) return {}
+
+  return {
+    left: `${center.x * 100}%`,
+    top: `${center.y * 100}%`,
+  }
+})
+const fingerStates = computed(() => {
+  const fingers = visionResult.value?.hand?.fingers
+  return [
+    { key: 'thumb', label: '拇指', active: Boolean(fingers?.thumb) },
+    { key: 'index', label: '食指', active: Boolean(fingers?.index) },
+    { key: 'middle', label: '中指', active: Boolean(fingers?.middle) },
+    { key: 'ring', label: '无名指', active: Boolean(fingers?.ring) },
+    { key: 'pinky', label: '小指', active: Boolean(fingers?.pinky) },
+  ]
+})
+const debugStatusText = computed(() => {
+  const debug = visionResult.value?.debug
+  if (!cameraEnabled.value) return '摄像头未开启'
+  if (debug?.mediapipeAvailable === false) return 'MediaPipe 未加载'
+  if (!visionResult.value?.hand) return '未检测到手'
+  if (debug?.pageTurnArmed) return '翻页模式'
+  if (debug?.pageTurnPoseMatched) return '保持姿势中'
+  return '手部已检测'
+})
+const debugDetailText = computed(() => {
+  const debug = visionResult.value?.debug
+  const hand = visionResult.value?.hand
+  if (debug?.mediapipeAvailable === false) return debug.mediapipeError || '请安装 mediapipe 后重启后端'
+  if (!cameraEnabled.value) return '开启摄像头后显示识别结果'
+  if (!hand) return '把手放进摄像头画面，尽量保持掌心清晰'
+  const holdText = debug?.pageTurnPoseMatched
+    ? ` · 保持 ${Math.round((debug.pageTurnHoldProgress ?? 0) * 100)}%`
+    : ''
+  const cooldownText = (debug?.pageTurnCooldownRemaining ?? 0) > 0
+    ? ` · 冷却 ${debug?.pageTurnCooldownRemaining?.toFixed(1)}s`
+    : ''
+  return `${hand.source || debug?.handSource || 'unknown'} · ${hand.pose} · ${(hand.confidence * 100).toFixed(0)}%${holdText}${cooldownText}`
 })
 
 const processSteps = [
@@ -337,7 +407,8 @@ function nextSlide() {
 function executeCommand(action: string, source: 'gesture' | 'voice' | 'button' = 'button') {
   const now = Date.now()
   const needsCooldown = action === 'next' || action === 'previous'
-  if (needsCooldown && now - lastCommandAt < 950) return
+  const commandCooldownMs = source === 'gesture' ? 5000 : 950
+  if (needsCooldown && now - lastCommandAt < commandCooldownMs) return
   if (needsCooldown) lastCommandAt = now
 
   if (action === 'next') nextSlide()
@@ -479,6 +550,10 @@ async function startCamera() {
       videoRef.value.srcObject = stream
       await videoRef.value.play()
     }
+    if (debugVideoRef.value) {
+      debugVideoRef.value.srcObject = stream
+      await debugVideoRef.value.play()
+    }
     startVisionLoop()
   } catch {
     cameraEnabled.value = false
@@ -492,6 +567,7 @@ function stopCamera() {
   cameraStream.value = null
   cameraEnabled.value = false
   if (videoRef.value) videoRef.value.srcObject = null
+  if (debugVideoRef.value) debugVideoRef.value.srcObject = null
   stopVisionLoop()
 }
 
@@ -843,6 +919,32 @@ onBeforeUnmount(() => {
           </div>
         </aside>
 
+        <aside class="hand-debug-panel">
+          <header>
+            <span>手指调试</span>
+            <b :class="{ ready: visionResult?.debug?.pageTurnArmed }">{{ debugStatusText }}</b>
+          </header>
+          <div class="debug-video-box">
+            <video v-show="cameraEnabled" ref="debugVideoRef" muted playsinline></video>
+            <div v-if="!cameraEnabled" class="debug-video-placeholder">
+              <Video :size="26" />
+              <span>摄像头未开启</span>
+            </div>
+            <div v-if="visionResult?.hand" class="hand-frame" :style="handFrameStyle"></div>
+            <span v-if="visionResult?.hand" class="hand-center" :style="handCenterStyle"></span>
+          </div>
+          <div class="finger-grid">
+            <span
+              v-for="finger in fingerStates"
+              :key="finger.key"
+              :class="{ active: finger.active }"
+            >
+              {{ finger.label }}
+            </span>
+          </div>
+          <p>{{ debugDetailText }}</p>
+        </aside>
+
         <aside class="assist-card">
           <p>
             <Hand :size="23" />
@@ -954,9 +1056,9 @@ onBeforeUnmount(() => {
         <label class="setting-row">
           <span>
             手势冷却时间
-            <small>降低连续误触发，参考开源项目的 cooldown 设计</small>
+            <small>翻页手势固定 5 秒冷却，防止连续误触发</small>
           </span>
-          <input v-model.number="visionSettings.cooldownSeconds" min="0.4" max="5" step="0.1" type="range" />
+          <input v-model.number="visionSettings.cooldownSeconds" min="5" max="5" step="0.1" type="range" disabled />
           <b>{{ visionSettings.cooldownSeconds.toFixed(1) }}s</b>
         </label>
 
@@ -1665,6 +1767,124 @@ onBeforeUnmount(() => {
   font-weight: 800;
 }
 
+.hand-debug-panel {
+  position: absolute;
+  right: 28px;
+  top: 22px;
+  z-index: 7;
+  width: clamp(260px, 17vw, 326px);
+  overflow: hidden;
+  border: 1px solid rgb(255 255 255 / 0.18);
+  border-radius: 10px;
+  background: rgb(13 27 47 / 0.78);
+  color: white;
+  box-shadow: 0 18px 42px rgb(12 28 52 / 0.26);
+  backdrop-filter: blur(14px);
+}
+
+.hand-debug-panel header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgb(255 255 255 / 0.1);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.hand-debug-panel header b {
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.08);
+  color: #b8c7dc;
+  padding: 3px 8px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.hand-debug-panel header b.ready {
+  background: rgb(32 231 147 / 0.16);
+  color: #76f2bd;
+}
+
+.debug-video-box {
+  position: relative;
+  height: clamp(132px, 9.5vw, 176px);
+  overflow: hidden;
+  background: #07111f;
+}
+
+.debug-video-box video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+}
+
+.debug-video-placeholder {
+  display: grid;
+  height: 100%;
+  place-items: center;
+  color: #9fb0c8;
+  font-size: 13px;
+}
+
+.debug-video-placeholder span {
+  margin-top: 6px;
+}
+
+.hand-frame {
+  position: absolute;
+  border: 2px solid #20e793;
+  box-shadow:
+    0 0 0 1px rgb(255 255 255 / 0.65),
+    0 0 18px rgb(32 231 147 / 0.42);
+}
+
+.hand-center {
+  position: absolute;
+  width: 13px;
+  height: 13px;
+  transform: translate(-50%, -50%);
+  border: 2px solid white;
+  border-radius: 999px;
+  background: #ffcc4d;
+  box-shadow: 0 0 18px rgb(255 204 77 / 0.7);
+}
+
+.finger-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px;
+  padding: 10px 12px 0;
+}
+
+.finger-grid span {
+  min-width: 0;
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-radius: 7px;
+  background: rgb(255 255 255 / 0.06);
+  color: #b6c3d6;
+  padding: 6px 2px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.finger-grid span.active {
+  border-color: rgb(32 231 147 / 0.38);
+  background: rgb(32 231 147 / 0.14);
+  color: #78f2be;
+}
+
+.hand-debug-panel p {
+  margin: 0;
+  padding: 10px 12px 12px;
+  color: #aebbd0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .assist-card {
   position: absolute;
   right: 28px;
@@ -2081,6 +2301,16 @@ onBeforeUnmount(() => {
   .camera-preview {
     width: 190px;
     height: 96px;
+  }
+
+  .hand-debug-panel {
+    right: 10px;
+    top: 116px;
+    width: min(250px, calc(100vw - 20px));
+  }
+
+  .debug-video-box {
+    height: 118px;
   }
 
   .assist-card {

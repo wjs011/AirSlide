@@ -29,6 +29,8 @@ PRESENTATIONS_DIR = STORAGE_DIR / "presentations"
 ALLOWED_EXTENSIONS = {".ppt", ".pptx"}
 EXPORT_WIDTH = 1920
 EXPORT_HEIGHT = 1080
+PAGE_TURN_COOLDOWN_SECONDS = 5.0
+PAGE_TURN_HOLD_SECONDS = 1.0
 
 STORAGE_DIR.mkdir(exist_ok=True)
 PRESENTATIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,6 +41,7 @@ class VisionResult:
     face: Optional[Dict[str, Any]] = None
     hand: Optional[Dict[str, Any]] = None
     gesture: Optional[Dict[str, Any]] = None
+    debug: Optional[Dict[str, Any]] = None
     status: str = "no-signal"
     latency_ms: int = 0
 
@@ -66,8 +69,11 @@ class VisionManager:
         )
         self._previous_frames: Dict[str, Any] = {}
         self._last_action_at: Dict[str, float] = defaultdict(float)
+        self._activation_started_at: Dict[str, float] = defaultdict(float)
+        self._page_turn_armed: Dict[str, bool] = defaultdict(bool)
         self._opencv_error: Optional[str] = None
-        self.cooldown_seconds = 1.25
+        self._mediapipe_error: Optional[str] = None
+        self.cooldown_seconds = PAGE_TURN_COOLDOWN_SECONDS
         self.swipe_threshold = 0.14
         self.confidence_threshold = 0.45
 
@@ -84,6 +90,22 @@ class VisionManager:
             self.np = None
             self.face_cascade = None
             self._opencv_error = str(exc)
+
+        try:
+            import mediapipe as mp
+
+            self.mp_hands = mp.solutions.hands
+            self.hands = self.mp_hands.Hands(
+                static_image_mode=False,
+                max_num_hands=1,
+                model_complexity=0,
+                min_detection_confidence=0.55,
+                min_tracking_confidence=0.5,
+            )
+        except Exception as exc:
+            self.mp_hands = None
+            self.hands = None
+            self._mediapipe_error = str(exc)
 
     def _empty_result(self, started_at: float, status: str = "no-signal") -> VisionResult:
         return VisionResult(status=status, latency_ms=int((time.perf_counter() - started_at) * 1000))
@@ -178,6 +200,7 @@ class VisionManager:
                 "height": round(h / height, 4),
             },
             "pose": pose,
+            "source": "opencv-skin",
             "confidence": round(min(0.96, max(0.45, contour_area / (width * height * 0.05))), 2),
         }
 
@@ -238,37 +261,153 @@ class VisionManager:
                 "height": round(h / height, 4),
             },
             "pose": "motion",
+            "source": "opencv-motion",
             "confidence": round(min(0.92, max(0.5, contour_area / (width * height * 0.08))), 2),
         }
 
-    def _classify_motion(self, client_id: str, hand: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        if hand is None:
+    def _detect_landmark_hand(self, image: Any) -> Optional[Dict[str, Any]]:
+        if self.cv2 is None or self.hands is None:
             return None
 
+        rgb = self.cv2.cvtColor(image, self.cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        result = self.hands.process(rgb)
+        if not result.multi_hand_landmarks:
+            return None
+
+        landmarks = result.multi_hand_landmarks[0].landmark
+        xs = [point.x for point in landmarks]
+        ys = [point.y for point in landmarks]
+        x1 = max(0.0, min(xs))
+        y1 = max(0.0, min(ys))
+        x2 = min(1.0, max(xs))
+        y2 = min(1.0, max(ys))
+        confidence = result.multi_handedness[0].classification[0].score if result.multi_handedness else 0.72
+
+        fingers = {
+            "index": self._is_finger_extended(landmarks, 8, 6),
+            "middle": self._is_finger_extended(landmarks, 12, 10),
+            "ring": self._is_finger_extended(landmarks, 16, 14),
+            "pinky": self._is_finger_extended(landmarks, 20, 18),
+            "thumb": self._is_thumb_extended(landmarks),
+        }
+        page_turn_ready = (
+            fingers["index"]
+            and fingers["middle"]
+            and not fingers["pinky"]
+            and not fingers["ring"]
+        )
+
+        return {
+            "center": {
+                "x": round((landmarks[0].x + landmarks[9].x) / 2, 4),
+                "y": round((landmarks[0].y + landmarks[9].y) / 2, 4),
+            },
+            "box": {
+                "x": round(x1, 4),
+                "y": round(y1, 4),
+                "width": round(max(0.01, x2 - x1), 4),
+                "height": round(max(0.01, y2 - y1), 4),
+            },
+            "pose": "page_turn_ready" if page_turn_ready else "landmark_hand",
+            "source": "mediapipe-hands",
+            "confidence": round(max(0.55, min(0.98, confidence)), 2),
+            "fingers": fingers,
+        }
+
+    def _is_finger_extended(self, landmarks: Any, tip_index: int, pip_index: int) -> bool:
+        return landmarks[tip_index].y < landmarks[pip_index].y - 0.025
+
+    def _is_thumb_extended(self, landmarks: Any) -> bool:
+        tip = landmarks[4]
+        ip = landmarks[3]
+        mcp = landmarks[2]
+        lateral_extension = abs(tip.x - mcp.x) > abs(ip.x - mcp.x) + 0.035
+        upward_extension = tip.y < mcp.y - 0.035
+        return lateral_extension or upward_extension
+
+    def _classify_motion(
+        self,
+        client_id: str,
+        hand: Optional[Dict[str, Any]],
+        landmark_hand: Optional[Dict[str, Any]],
+        motion_hand: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         now = time.perf_counter()
-        center = hand["center"]
+        pose_matched = landmark_hand is not None and landmark_hand["pose"] == "page_turn_ready"
+        cooldown_remaining = max(0.0, self.cooldown_seconds - (now - self._last_action_at[client_id]))
+
+        if pose_matched:
+            if self._activation_started_at[client_id] == 0.0:
+                self._activation_started_at[client_id] = now
+            hold_elapsed = now - self._activation_started_at[client_id]
+            if hold_elapsed >= PAGE_TURN_HOLD_SECONDS and cooldown_remaining <= 0:
+                self._page_turn_armed[client_id] = True
+        else:
+            self._activation_started_at[client_id] = 0.0
+
+        hold_progress = 0.0
+        if self._activation_started_at[client_id] > 0.0:
+            hold_progress = min(1.0, (now - self._activation_started_at[client_id]) / PAGE_TURN_HOLD_SECONDS)
+
+        if hand is None:
+            self._histories[client_id].clear()
+            self._page_turn_armed[client_id] = False
+            return None, {
+                "pageTurnPoseMatched": False,
+                "pageTurnHoldProgress": 0.0,
+                "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
+                "pageTurnArmed": False,
+                "pageTurnCooldownRemaining": round(cooldown_remaining, 2),
+            }
+
+        if not self._page_turn_armed[client_id]:
+            self._histories[client_id].clear()
+            return {
+                "name": "page-turn-hold" if pose_matched else hand["pose"],
+                "action": "pointer" if hand["pose"] in {"pointing", "motion", "landmark_hand"} else "open_hand",
+                "confidence": hand["confidence"],
+            }, {
+                "pageTurnPoseMatched": pose_matched,
+                "pageTurnHoldProgress": round(hold_progress, 2),
+                "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
+                "pageTurnArmed": False,
+                "pageTurnCooldownRemaining": round(cooldown_remaining, 2),
+            }
+
+        tracking_hand = motion_hand or landmark_hand or hand
+        center = tracking_hand["center"]
         history = self._histories[client_id]
         history.append((now, center["x"], center["y"]))
 
         action: Optional[str] = None
-        if len(history) >= 4:
+        if len(history) >= 4 and cooldown_remaining <= 0:
             first_time, first_x, first_y = history[0]
             last_time, last_x, last_y = history[-1]
             dx = last_x - first_x
             dy = abs(last_y - first_y)
             duration = max(last_time - first_time, 0.001)
-            cooldown_ready = now - self._last_action_at[client_id] > self.cooldown_seconds
 
-            if 0.12 <= duration <= 2.4 and abs(dx) > self.swipe_threshold and dy < 0.32 and cooldown_ready:
-                action = "next" if dx > 0 else "previous"
+            if 0.12 <= duration <= 2.4 and abs(dx) > self.swipe_threshold and dy < 0.32:
+                action = "next"
                 self._last_action_at[client_id] = now
+                self._page_turn_armed[client_id] = False
+                self._activation_started_at[client_id] = 0.0
                 history.clear()
 
-        gesture_name = "右滑" if action == "next" else "左滑" if action == "previous" else hand["pose"]
         return {
-            "name": gesture_name,
-            "action": action or ("pointer" if hand["pose"] in {"pointing", "motion"} else "open_hand"),
-            "confidence": hand["confidence"],
+            "name": "page-turn-next" if action == "next" else "page-turn-armed",
+            "action": action or "open_hand",
+            "confidence": tracking_hand["confidence"],
+        }, {
+            "pageTurnPoseMatched": pose_matched,
+            "pageTurnHoldProgress": round(hold_progress, 2),
+            "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
+            "pageTurnArmed": self._page_turn_armed[client_id],
+            "pageTurnCooldownRemaining": round(
+                max(0.0, self.cooldown_seconds - (time.perf_counter() - self._last_action_at[client_id])),
+                2,
+            ),
         }
 
     async def process_frame(self, frame: bytes, client_id: str = "default") -> VisionResult:
@@ -279,25 +418,38 @@ class VisionManager:
                 return self._empty_result(started_at, "opencv-unavailable")
 
             face = self._detect_face(image)
+            landmark_hand = self._detect_landmark_hand(image)
             skin_hand = self._detect_hand(image, face)
             motion_hand = self._detect_motion_hand(client_id, image, face)
-            if skin_hand is not None and motion_hand is not None:
+            if landmark_hand is not None:
+                hand = landmark_hand
+            elif skin_hand is not None and motion_hand is not None:
                 hand = skin_hand if skin_hand["confidence"] >= motion_hand["confidence"] + 0.12 else motion_hand
             else:
                 hand = skin_hand or motion_hand
-            gesture = self._classify_motion(client_id, hand)
+            gesture, gesture_debug = self._classify_motion(client_id, hand, landmark_hand, motion_hand)
             status = "detected" if face or hand else "no-signal"
+            debug = {
+                "mediapipeAvailable": self.hands is not None,
+                "mediapipeError": self._mediapipe_error,
+                "opencvAvailable": self.cv2 is not None,
+                "opencvError": self._opencv_error,
+                "handSource": hand.get("source") if hand else None,
+                "pageTurnCooldownSeconds": self.cooldown_seconds,
+                **gesture_debug,
+            }
             return VisionResult(
                 face=face,
                 hand=hand,
                 gesture=gesture,
+                debug=debug,
                 status=status,
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
             )
 
     def update_settings(self, settings: VisionSettingsPayload) -> Dict[str, float]:
         if settings.cooldownSeconds is not None:
-            self.cooldown_seconds = min(5.0, max(0.4, settings.cooldownSeconds))
+            self.cooldown_seconds = PAGE_TURN_COOLDOWN_SECONDS
         if settings.swipeThreshold is not None:
             self.swipe_threshold = min(0.5, max(0.08, settings.swipeThreshold))
         if settings.confidenceThreshold is not None:
@@ -650,6 +802,7 @@ async def process_vision_frame(payload: VisionFramePayload) -> dict[str, Any]:
         "face": result.face,
         "hand": result.hand,
         "gesture": result.gesture,
+        "debug": result.debug,
         "latencyMs": result.latency_ms,
     }
 
