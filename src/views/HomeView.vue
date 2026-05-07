@@ -117,6 +117,7 @@ const apiBase = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 const fileInput = ref<HTMLInputElement | null>(null)
 const stageRef = ref<HTMLElement | null>(null)
 const videoRef = ref<HTMLVideoElement | null>(null)
+const previewCanvasRef = ref<HTMLCanvasElement | null>(null)
 const debugVideoRef = ref<HTMLVideoElement | null>(null)
 const frameCanvasRef = ref<HTMLCanvasElement | null>(null)
 const cameraStream = ref<MediaStream | null>(null)
@@ -132,6 +133,12 @@ const cameraEnabled = ref(false)
 const cameraError = ref('')
 const errorMessage = ref('')
 const visionResult = ref<VisionResult | null>(null)
+const faceTrackingEnabled = ref(true)
+const targetFaceCenter = ref<Point>({ x: 0.5, y: 0.5 })
+const targetFaceZoom = ref(1.04)
+const trackedFaceCenter = ref<Point>({ x: 0.5, y: 0.5 })
+const trackedFaceZoom = ref(1.04)
+const trackedFaceSize = ref(0.24)
 const visionStatus = ref('视觉待机')
 const pointerPosition = ref<Point>({ x: 0.72, y: 0.58 })
 const zoomPoint = ref<Point>({ x: 0.72, y: 0.55 })
@@ -153,8 +160,19 @@ const visionSettings = ref<VisionSettings>({
 
 let timerId: number | undefined
 let visionTimerId: number | undefined
+let previewFrameId: number | undefined
 let annotationId = 0
 let lastCommandAt = 0
+let visionRequestInFlight = false
+let lastFaceDetectedAt = 0
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value))
+}
+
+function blend(current: number, target: number, factor: number) {
+  return current + (target - current) * factor
+}
 
 const currentSlide = computed(() => deck.value?.slides[currentIndex.value] ?? null)
 const hasDeck = computed(() => Boolean(deck.value?.slides.length))
@@ -211,15 +229,16 @@ const latencyText = computed(() => {
   if (recognitionPaused.value) return '识别已暂停'
   return `延迟 ${visionResult.value?.latencyMs ?? 38}ms`
 })
-const faceFrameStyle = computed(() => {
+const faceGuideStyle = computed(() => {
   const box = visionResult.value?.face?.box
-  if (!box) return {}
+  const width = box ? clamp(box.width * 58, 18, 28) : 21
+  const height = box ? clamp(box.height * 100, 34, 58) : 42
 
   return {
-    left: `${Math.max(6, box.x * 58)}%`,
-    top: `${Math.max(8, box.y * 100)}%`,
-    width: `${Math.max(18, box.width * 58)}%`,
-    height: `${Math.max(34, box.height * 100)}%`,
+    left: `${29 - width / 2}%`,
+    top: `${50 - height / 2}%`,
+    width: `${width}%`,
+    height: `${height}%`,
   }
 })
 const pointerStyle = computed(() => ({
@@ -451,7 +470,7 @@ function startVisionLoop() {
   visionStatus.value = '视觉识别中'
   visionTimerId = window.setInterval(() => {
     void captureVisionFrame()
-  }, 180)
+  }, 90)
 }
 
 function stopVisionLoop() {
@@ -459,6 +478,13 @@ function stopVisionLoop() {
   visionTimerId = undefined
   visionStatus.value = '视觉待机'
   visionResult.value = null
+  visionRequestInFlight = false
+  lastFaceDetectedAt = 0
+  targetFaceCenter.value = { x: 0.5, y: 0.5 }
+  targetFaceZoom.value = 1.04
+  trackedFaceCenter.value = { x: 0.5, y: 0.5 }
+  trackedFaceZoom.value = 1.04
+  trackedFaceSize.value = 0.24
 }
 
 async function loadVisionSettings() {
@@ -490,6 +516,7 @@ async function saveVisionSettings() {
 async function captureVisionFrame() {
   if (recognitionPaused.value || !cameraEnabled.value || !videoRef.value || !frameCanvasRef.value) return
   if (videoRef.value.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return
+  if (visionRequestInFlight) return
 
   const canvas = frameCanvasRef.value
   const context = canvas.getContext('2d')
@@ -504,6 +531,7 @@ async function captureVisionFrame() {
 
   const data = canvas.toDataURL('image/jpeg', 0.58)
   const startedAt = performance.now()
+  visionRequestInFlight = true
   try {
     const response = await fetch(`${apiBase}/api/vision/frame`, {
       method: 'POST',
@@ -516,12 +544,15 @@ async function captureVisionFrame() {
     payload.latencyMs = payload.latencyMs || Math.round(performance.now() - startedAt)
     applyVisionResult(payload)
   } catch {
-    visionStatus.value = '视觉连接失败'
+    visionStatus.value = '??????'
+  } finally {
+    visionRequestInFlight = false
   }
 }
 
 function applyVisionResult(payload: VisionResult) {
   visionResult.value = payload
+  updateTrackedFaceCenter(payload.face)
   visionStatus.value = payload.status === 'detected' ? '视觉识别中' : '未检测到有效手势'
 
   if (payload.hand?.center) {
@@ -532,6 +563,133 @@ function applyVisionResult(payload: VisionResult) {
   const action = payload.gesture?.action
   if (action === 'next' || action === 'previous') {
     executeCommand(action, 'gesture')
+  }
+}
+
+function updateTrackedFaceCenter(face: VisionResult['face']) {
+  const now = performance.now()
+  if (face) {
+    lastFaceDetectedAt = now
+  }
+
+  const shouldHoldLastTarget = !face && now - lastFaceDetectedAt < 420
+  const target = shouldHoldLastTarget ? targetFaceCenter.value : (face?.center ?? { x: 0.5, y: 0.5 })
+  targetFaceCenter.value = {
+    x: clamp(target.x, 0.1, 0.9),
+    y: clamp(target.y, 0.16, 0.84),
+  }
+
+  if (!faceTrackingEnabled.value || (!face && !shouldHoldLastTarget)) {
+    targetFaceZoom.value = 1.04
+    return
+  }
+
+  if (!face) {
+    return
+  }
+
+  const observedFaceSize = clamp((face.box.width + face.box.height * 0.6) / 1.6, 0.16, 0.42)
+  trackedFaceSize.value = blend(trackedFaceSize.value, observedFaceSize, 0.18)
+
+  // Ignore tiny width changes caused by lateral motion and detector jitter.
+  if (Math.abs(observedFaceSize - trackedFaceSize.value) < 0.012) {
+    return
+  }
+
+  // Face larger => user closer => zoom out slightly.
+  // Face smaller => user farther => zoom in slightly.
+  const normalisedDistance = clamp((0.24 - trackedFaceSize.value) / 0.09, -1, 1)
+  targetFaceZoom.value = clamp(1.08 + normalisedDistance * 0.2, 0.96, 1.28)
+}
+
+function renderPreviewFrame() {
+  if (!previewCanvasRef.value || !videoRef.value) return
+
+  const canvas = previewCanvasRef.value
+  const video = videoRef.value
+  const context = canvas.getContext('2d')
+  if (!context) return
+
+  const width = canvas.clientWidth || 1
+  const height = canvas.clientHeight || 1
+  const dpr = window.devicePixelRatio || 1
+  const renderWidth = Math.max(1, Math.round(width * dpr))
+  const renderHeight = Math.max(1, Math.round(height * dpr))
+
+  if (canvas.width !== renderWidth || canvas.height !== renderHeight) {
+    canvas.width = renderWidth
+    canvas.height = renderHeight
+  }
+
+  context.setTransform(1, 0, 0, 1, 0, 0)
+  context.clearRect(0, 0, renderWidth, renderHeight)
+
+  if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.videoWidth === 0 || video.videoHeight === 0) {
+    return
+  }
+
+  const centerFactor = faceTrackingEnabled.value ? 0.1 : 0.08
+  const zoomFactor = faceTrackingEnabled.value ? 0.06 : 0.04
+  const edgeDistance = Math.min(
+    targetFaceCenter.value.x,
+    1 - targetFaceCenter.value.x,
+    targetFaceCenter.value.y,
+    1 - targetFaceCenter.value.y,
+  )
+  trackedFaceCenter.value = {
+    x: clamp(blend(trackedFaceCenter.value.x, targetFaceCenter.value.x, centerFactor), 0.1, 0.9),
+    y: clamp(blend(trackedFaceCenter.value.y, targetFaceCenter.value.y, centerFactor), 0.16, 0.84),
+  }
+  const edgeSafeZoom = edgeDistance < 0.16 ? Math.min(targetFaceZoom.value, 1.08) : targetFaceZoom.value
+  trackedFaceZoom.value = blend(trackedFaceZoom.value, edgeSafeZoom, zoomFactor)
+
+  const sourceWidth = video.videoWidth
+  const sourceHeight = video.videoHeight
+  const outputAspect = renderWidth / renderHeight
+  const sourceAspect = sourceWidth / sourceHeight
+  const zoom = faceTrackingEnabled.value ? trackedFaceZoom.value : 1
+
+  let cropWidth = sourceWidth
+  let cropHeight = sourceHeight
+
+  if (sourceAspect > outputAspect) {
+    cropWidth = sourceHeight * outputAspect
+  } else {
+    cropHeight = sourceWidth / outputAspect
+  }
+
+  cropWidth = cropWidth / zoom
+  cropHeight = cropHeight / zoom
+
+  const previewCenterX = faceTrackingEnabled.value ? clamp(trackedFaceCenter.value.x, 0.12, 0.88) : 0.5
+  const previewCenterY = faceTrackingEnabled.value ? clamp(trackedFaceCenter.value.y, 0.18, 0.82) : 0.5
+  const rawCenterX = 1 - previewCenterX
+  const rawCenterY = previewCenterY
+  const sourceX = clamp(rawCenterX * sourceWidth - cropWidth / 2, 0, sourceWidth - cropWidth)
+  const sourceY = clamp(rawCenterY * sourceHeight - cropHeight / 2, 0, sourceHeight - cropHeight)
+
+  context.save()
+  context.translate(renderWidth, 0)
+  context.scale(-1, 1)
+  context.drawImage(video, sourceX, sourceY, cropWidth, cropHeight, 0, 0, renderWidth, renderHeight)
+  context.restore()
+}
+
+function startPreviewLoop() {
+  stopPreviewLoop()
+
+  const step = () => {
+    renderPreviewFrame()
+    previewFrameId = window.requestAnimationFrame(step)
+  }
+
+  previewFrameId = window.requestAnimationFrame(step)
+}
+
+function stopPreviewLoop() {
+  if (previewFrameId !== undefined) {
+    window.cancelAnimationFrame(previewFrameId)
+    previewFrameId = undefined
   }
 }
 
@@ -554,6 +712,7 @@ async function startCamera() {
       debugVideoRef.value.srcObject = stream
       await debugVideoRef.value.play()
     }
+    startPreviewLoop()
     startVisionLoop()
   } catch {
     cameraEnabled.value = false
@@ -566,6 +725,7 @@ function stopCamera() {
   cameraStream.value?.getTracks().forEach((track) => track.stop())
   cameraStream.value = null
   cameraEnabled.value = false
+  stopPreviewLoop()
   if (videoRef.value) videoRef.value.srcObject = null
   if (debugVideoRef.value) debugVideoRef.value.srcObject = null
   stopVisionLoop()
@@ -748,6 +908,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
   if (timerId) window.clearInterval(timerId)
+  stopPreviewLoop()
   stopVoice()
   stopCamera()
 })
@@ -901,7 +1062,10 @@ onBeforeUnmount(() => {
 
         <aside class="camera-preview">
           <span class="camera-dot"></span>
-          <video v-show="cameraEnabled" ref="videoRef" muted playsinline></video>
+          <div v-if="cameraEnabled" class="camera-video-surface">
+            <canvas ref="previewCanvasRef" class="camera-preview-canvas"></canvas>
+            <video ref="videoRef" class="camera-source-video" muted playsinline></video>
+          </div>
           <div v-if="!cameraEnabled" class="mock-face">
             <div class="hair"></div>
             <div class="head"></div>
@@ -912,7 +1076,7 @@ onBeforeUnmount(() => {
             <span class="eye eye-right"></span>
             <span class="mouth"></span>
           </div>
-          <div class="face-frame" :style="faceFrameStyle"></div>
+          <div class="face-frame" :class="{ active: Boolean(visionResult?.face), passive: !visionResult?.face }" :style="faceGuideStyle"></div>
           <div class="camera-copy">
             <strong>{{ faceStatusText }}</strong>
             <span>{{ distanceText }}</span>
@@ -1650,11 +1814,26 @@ onBeforeUnmount(() => {
   border: 2px solid white;
 }
 
-.camera-preview video {
+.camera-video-surface {
+  position: absolute;
+  inset: 0 auto 0 0;
   width: 58%;
+  overflow: hidden;
+}
+
+.camera-preview-canvas {
+  width: 100%;
   height: 100%;
-  object-fit: cover;
-  transform: scaleX(-1);
+  display: block;
+}
+
+.camera-source-video {
+  position: absolute;
+  inset: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .mock-face {
@@ -1743,12 +1922,28 @@ onBeforeUnmount(() => {
 
 .face-frame {
   position: absolute;
-  left: 11%;
-  top: 27%;
-  width: 38%;
-  height: 62%;
-  border: 2px solid white;
-  box-shadow: 0 0 0 1px rgb(31 130 255 / 0.15);
+  border: 2px solid rgb(255 255 255 / 0.78);
+  border-radius: 14px;
+  box-shadow:
+    0 0 0 1px rgb(31 130 255 / 0.15),
+    0 0 18px rgb(31 130 255 / 0.18);
+  transition:
+    width 180ms ease-out,
+    height 180ms ease-out,
+    border-color 180ms ease-out,
+    box-shadow 180ms ease-out;
+}
+
+.face-frame.active {
+  border-color: rgb(32 231 147 / 0.95);
+  box-shadow:
+    0 0 0 1px rgb(32 231 147 / 0.24),
+    0 0 22px rgb(32 231 147 / 0.24);
+}
+
+.face-frame.passive {
+  border-style: dashed;
+  opacity: 0.72;
 }
 
 .camera-copy {
