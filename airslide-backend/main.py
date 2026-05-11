@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import json
@@ -10,13 +12,15 @@ import uuid
 import zipfile
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from email import policy
+from email.parser import BytesParser
 from html import escape
 from pathlib import Path
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from xml.etree import ElementTree
 
 import socketio
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -59,6 +63,27 @@ class VisionSettingsPayload(BaseModel):
     cooldownSeconds: Optional[float] = None
     swipeThreshold: Optional[float] = None
     confidenceThreshold: Optional[float] = None
+
+
+class VoiceCandidatePayload(BaseModel):
+    text: str
+    isFinal: bool = True
+    confidence: float = 0.0
+
+
+class VoiceRecognitionPayload(BaseModel):
+    candidates: List[VoiceCandidatePayload] = []
+    text: Optional[str] = None
+    isFinal: bool = True
+    showEndConfirm: bool = False
+
+
+class VoiceCommandPattern(BaseModel):
+    action: str
+    label: str
+    phrases: List[str]
+    weakPhrases: List[str] = []
+    patterns: List[str] = []
 
 
 class VisionManager:
@@ -545,9 +570,249 @@ class PresentationController:
 presentation_controller = PresentationController()
 
 
+VOICE_FINAL_SCORE_THRESHOLD = 3.1
+VOICE_INTERIM_SCORE_THRESHOLD = 4.35
+VOICE_FAST_ACTIONS = {
+    "next",
+    "previous",
+    "pointer",
+    "pen",
+    "zoom",
+    "pause",
+    "resume",
+    "confirm-end",
+    "cancel-end",
+}
+
+VOICE_COMMAND_PATTERNS: List[VoiceCommandPattern] = [
+    VoiceCommandPattern(
+        action="next",
+        label="下一页",
+        phrases=["下一页", "下页", "下一张", "下张", "下一屏", "下一个页面", "往后翻", "向后翻", "后翻", "翻到下一页"],
+        weakPhrases=["下一个", "往后", "向后", "前进", "继续播放", "next"],
+        patterns=[r"下(?:一)?(?:页|张|屏)", r"(?:往后|向后|后翻|前进)(?:翻|一页|一张)?"],
+    ),
+    VoiceCommandPattern(
+        action="previous",
+        label="上一页",
+        phrases=["上一页", "上页", "上一张", "上张", "前一页", "前一张", "上一屏", "返回上一页", "往前翻", "向前翻", "前翻"],
+        weakPhrases=["上一个", "返回", "往前", "向前", "后退", "previous", "back"],
+        patterns=[r"(?:上|前)(?:一)?(?:页|张|屏)", r"(?:往前|向前|前翻|后退)(?:翻|一页|一张)?"],
+    ),
+    VoiceCommandPattern(
+        action="pointer",
+        label="空气指针",
+        phrases=["空气指针", "打开指针", "切换指针", "指针模式", "激光笔", "光标", "指示器", "鼠标"],
+        weakPhrases=["指针", "pointer"],
+    ),
+    VoiceCommandPattern(
+        action="pen",
+        label="标注模式",
+        phrases=["标注模式", "打开标注", "开始标注", "画笔模式", "打开画笔", "批注模式", "写字模式", "画线"],
+        weakPhrases=["标注", "画笔", "批注", "手写", "涂鸦", "pen"],
+    ),
+    VoiceCommandPattern(
+        action="zoom",
+        label="区域放大",
+        phrases=["区域放大", "局部放大", "打开放大", "放大模式", "放大镜", "缩放模式"],
+        weakPhrases=["放大", "缩放", "区域", "zoom"],
+    ),
+    VoiceCommandPattern(
+        action="pause",
+        label="暂停识别",
+        phrases=["暂停识别", "暂停演示", "暂停播放", "暂停一下", "先暂停", "停一下", "停止识别"],
+        weakPhrases=["暂停", "pause"],
+    ),
+    VoiceCommandPattern(
+        action="resume",
+        label="继续识别",
+        phrases=["继续识别", "恢复识别", "继续演示", "继续播放", "恢复播放", "接着讲", "继续讲"],
+        weakPhrases=["继续", "恢复", "开始识别", "resume"],
+    ),
+    VoiceCommandPattern(
+        action="end",
+        label="结束演示",
+        phrases=["结束演示", "结束放映", "结束展示", "退出演示", "退出放映", "停止演示", "关闭演示"],
+        weakPhrases=["结束吧", "退出吧", "end"],
+    ),
+    VoiceCommandPattern(
+        action="first",
+        label="第一页",
+        phrases=["第一页", "第一张", "回到第一页", "回到首页", "跳到第一页", "返回开头"],
+        weakPhrases=["首页", "开头"],
+    ),
+    VoiceCommandPattern(
+        action="last",
+        label="最后一页",
+        phrases=["最后一页", "最后一张", "跳到最后一页", "到最后一页", "放到最后"],
+        weakPhrases=["尾页", "末页", "结尾"],
+    ),
+    VoiceCommandPattern(
+        action="fullscreen",
+        label="全屏放映",
+        phrases=["进入全屏", "全屏放映", "开始放映", "放映模式", "全屏模式"],
+        weakPhrases=["全屏"],
+    ),
+    VoiceCommandPattern(
+        action="clear-annotations",
+        label="清除标注",
+        phrases=["清除标注", "清空标注", "擦除标注", "清除画笔", "清空画笔", "删除标注"],
+        weakPhrases=["清屏"],
+    ),
+    VoiceCommandPattern(
+        action="confirm-end",
+        label="确认结束",
+        phrases=["确认结束", "确定结束", "确认退出", "确定退出", "确认关闭"],
+        weakPhrases=["确认", "确定"],
+    ),
+    VoiceCommandPattern(
+        action="cancel-end",
+        label="继续演示",
+        phrases=["取消结束", "不要结束", "不结束", "别结束", "继续演示", "返回演示"],
+        weakPhrases=["取消", "返回", "继续"],
+    ),
+]
+
+
+def _normalise_voice_text(text: str) -> str:
+    command = text.lower()
+    command = re.sub(r"ppt|powerpoint", "演示", command)
+    command = re.sub(r"幻灯片|页面", "页", command)
+    return re.sub(r"""[\s,，.。!！?？:：;；、"'“”‘’`~·()（）\[\]【】{}<>《》/\\|-]""", "", command)
+
+
+def _voice_phrase_score(command: str, phrase: str, strong: bool) -> float:
+    normalised_phrase = _normalise_voice_text(phrase)
+    if not normalised_phrase or normalised_phrase not in command:
+        return 0.0
+
+    base = 5.4 if command == normalised_phrase else 4.0 if strong else 2.35
+    length_bonus = min(len(normalised_phrase) * (0.14 if strong else 0.08), 1.15 if strong else 0.68)
+    position_bonus = 0.16 if command.endswith(normalised_phrase) else 0.0
+    return base + length_bonus + position_bonus
+
+
+def _voice_command_score(pattern: VoiceCommandPattern, command: str) -> float:
+    score = 0.0
+    for phrase in pattern.phrases:
+        score = max(score, _voice_phrase_score(command, phrase, True))
+    for phrase in pattern.weakPhrases:
+        score = max(score, _voice_phrase_score(command, phrase, False))
+    for matcher in pattern.patterns:
+        if re.search(matcher, command):
+            score = max(score, 3.85)
+    return score
+
+
+def _voice_command_pool(show_end_confirm: bool) -> List[VoiceCommandPattern]:
+    if show_end_confirm:
+        return [item for item in VOICE_COMMAND_PATTERNS if item.action in {"confirm-end", "cancel-end"}]
+    return [item for item in VOICE_COMMAND_PATTERNS if item.action not in {"confirm-end", "cancel-end"}]
+
+
+def _match_voice_candidate(
+    candidate: VoiceCandidatePayload,
+    show_end_confirm: bool,
+) -> Optional[Dict[str, Any]]:
+    command = _normalise_voice_text(candidate.text)
+    if not command:
+        return None
+
+    best: Optional[Dict[str, Any]] = None
+    for pattern in _voice_command_pool(show_end_confirm):
+        score = _voice_command_score(pattern, command)
+        if score <= 0:
+            continue
+        confidence_bonus = min(max(candidate.confidence, 0.0), 1.0) * 0.55
+        final_bonus = 0.45 if candidate.isFinal else 0.0
+        match = {
+            "action": pattern.action,
+            "label": pattern.label,
+            "text": candidate.text,
+            "normalisedText": command,
+            "isFinal": candidate.isFinal,
+            "confidence": candidate.confidence,
+            "score": round(score + confidence_bonus + final_bonus, 3),
+        }
+        if best is None or match["score"] > best["score"]:
+            best = match
+    return best
+
+
+def recognise_voice_command(payload: VoiceRecognitionPayload) -> Dict[str, Any]:
+    candidates = list(payload.candidates)
+    if payload.text:
+        candidates.append(
+            VoiceCandidatePayload(
+                text=payload.text,
+                isFinal=payload.isFinal,
+                confidence=1.0 if payload.isFinal else 0.0,
+            )
+        )
+
+    deduped: Dict[str, VoiceCandidatePayload] = {}
+    for candidate in candidates:
+        key = _normalise_voice_text(candidate.text)
+        if not key:
+            continue
+        previous = deduped.get(key)
+        previous_rank = ((2 if previous and previous.isFinal else 0) + (previous.confidence if previous else -1))
+        candidate_rank = (2 if candidate.isFinal else 0) + candidate.confidence
+        if previous is None or candidate_rank >= previous_rank:
+            deduped[key] = candidate
+
+    matches = [
+        match
+        for candidate in deduped.values()
+        for match in [_match_voice_candidate(candidate, payload.showEndConfirm)]
+        if match is not None
+    ]
+    matches.sort(key=lambda item: item["score"], reverse=True)
+    best = matches[0] if matches else None
+    if best is None:
+        return {"matched": False, "action": None, "label": None, "score": 0.0, "candidates": []}
+
+    threshold = VOICE_FINAL_SCORE_THRESHOLD if best["isFinal"] else VOICE_INTERIM_SCORE_THRESHOLD
+    matched = best["score"] >= threshold and (best["isFinal"] or best["action"] in VOICE_FAST_ACTIONS)
+    return {
+        "matched": matched,
+        "action": best["action"],
+        "label": best["label"],
+        "score": best["score"],
+        "isFinal": best["isFinal"],
+        "text": best["text"],
+        "normalisedText": best["normalisedText"],
+        "candidates": matches[:3],
+    }
+
+
 def _safe_filename(filename: str) -> str:
     name = Path(filename).name.strip()
     return name or "presentation.pptx"
+
+
+async def _read_upload_from_request(request: Request) -> Tuple[str, bytes]:
+    content_type = request.headers.get("content-type", "")
+    if not content_type.lower().startswith("multipart/form-data"):
+        raise HTTPException(status_code=400, detail="请使用表单上传 PPT 文件")
+
+    body = await request.body()
+    message_bytes = (
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+        + body
+    )
+    message = BytesParser(policy=policy.default).parsebytes(message_bytes)
+
+    for part in message.iter_parts():
+        if part.get_param("name", header="content-disposition") != "file":
+            continue
+        filename = part.get_filename() or ""
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            payload = b""
+        return filename, payload
+
+    raise HTTPException(status_code=400, detail="未找到上传文件")
 
 
 def _natural_slide_key(path: Path) -> Tuple[int, str]:
@@ -742,13 +1007,13 @@ async def health() -> Dict[str, str]:
 
 
 @app.post("/api/presentations")
-async def upload_presentation(file: UploadFile = File(...)) -> dict[str, Any]:
-    original_name = _safe_filename(file.filename or "")
+async def upload_presentation(request: Request) -> dict[str, Any]:
+    filename, content = await _read_upload_from_request(request)
+    original_name = _safe_filename(filename)
     extension = Path(original_name).suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail="只支持上传 .ppt 或 .pptx 文件")
 
-    content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="上传文件为空")
 
@@ -815,6 +1080,11 @@ async def get_vision_settings() -> Dict[str, float]:
 @app.post("/api/vision/settings")
 async def update_vision_settings(payload: VisionSettingsPayload) -> Dict[str, float]:
     return vision_manager.update_settings(payload)
+
+
+@app.post("/api/voice/recognize")
+async def recognise_voice(payload: VoiceRecognitionPayload) -> Dict[str, Any]:
+    return recognise_voice_command(payload)
 
 
 @app.post("/api/presentation/control")

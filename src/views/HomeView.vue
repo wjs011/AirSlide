@@ -94,15 +94,73 @@ type VisionSettings = {
   confidenceThreshold: number
 }
 
+type CommandSource = 'gesture' | 'voice' | 'button'
+type CommandAction =
+  | 'next'
+  | 'previous'
+  | 'pointer'
+  | 'pen'
+  | 'zoom'
+  | 'pause'
+  | 'resume'
+  | 'end'
+  | 'confirm-end'
+  | 'first'
+  | 'last'
+  | 'fullscreen'
+  | 'clear-annotations'
+type VoiceAction = CommandAction | 'cancel-end'
+
 type SpeechRecognitionLike = {
   lang: string
   continuous: boolean
   interimResults: boolean
+  maxAlternatives?: number
   onresult: ((event: any) => void) | null
   onend: (() => void) | null
-  onerror: (() => void) | null
+  onerror: ((event: any) => void) | null
+  onaudiostart?: (() => void) | null
+  onspeechstart?: (() => void) | null
+  onspeechend?: (() => void) | null
   start: () => void
   stop: () => void
+}
+
+type VoiceCommandPattern = {
+  action: VoiceAction
+  label: string
+  phrases: string[]
+  weakPhrases?: string[]
+  patterns?: RegExp[]
+}
+
+type VoiceTranscriptCandidate = {
+  text: string
+  isFinal: boolean
+  confidence: number
+}
+
+type VoiceCommandMatch = VoiceTranscriptCandidate & {
+  action: VoiceAction
+  label: string
+  score: number
+}
+
+type BackendVoiceMatch = {
+  matched: boolean
+  action: VoiceAction | null
+  label: string | null
+  score: number
+  isFinal?: boolean
+  text?: string
+  candidates?: Array<{
+    action: VoiceAction
+    label: string
+    text: string
+    isFinal: boolean
+    confidence: number
+    score: number
+  }>
 }
 
 declare global {
@@ -163,6 +221,10 @@ let visionTimerId: number | undefined
 let previewFrameId: number | undefined
 let annotationId = 0
 let lastCommandAt = 0
+let lastVoiceAction = ''
+let lastVoiceActionAt = 0
+let ignoreVoiceEndRestart = false
+let voiceRequestSerial = 0
 let visionRequestInFlight = false
 let lastFaceDetectedAt = 0
 
@@ -172,6 +234,293 @@ function clamp(value: number, min: number, max: number) {
 
 function blend(current: number, target: number, factor: number) {
   return current + (target - current) * factor
+}
+
+const VOICE_FINAL_SCORE_THRESHOLD = 3.1
+const VOICE_INTERIM_SCORE_THRESHOLD = 4.35
+const VOICE_INTERIM_FAST_ACTIONS = new Set<VoiceAction>([
+  'next',
+  'previous',
+  'pointer',
+  'pen',
+  'zoom',
+  'pause',
+  'resume',
+  'confirm-end',
+  'cancel-end',
+])
+
+const VOICE_COMMANDS: VoiceCommandPattern[] = [
+  {
+    action: 'next',
+    label: '下一页',
+    phrases: ['下一页', '下页', '下一张', '下张', '下一屏', '下一个页面', '往后翻', '向后翻', '后翻', '翻到下一页'],
+    weakPhrases: ['下一个', '往后', '向后', '前进', '继续播放', 'next'],
+    patterns: [/下(?:一)?(?:页|张|屏)/, /(?:往后|向后|后翻|前进)(?:翻|一页|一张)?/],
+  },
+  {
+    action: 'previous',
+    label: '上一页',
+    phrases: ['上一页', '上页', '上一张', '上张', '前一页', '前一张', '上一屏', '返回上一页', '往前翻', '向前翻', '前翻'],
+    weakPhrases: ['上一个', '返回', '往前', '向前', '后退', 'previous', 'back'],
+    patterns: [/(?:上|前)(?:一)?(?:页|张|屏)/, /(?:往前|向前|前翻|后退)(?:翻|一页|一张)?/],
+  },
+  {
+    action: 'pointer',
+    label: '空气指针',
+    phrases: ['空气指针', '打开指针', '切换指针', '指针模式', '激光笔', '光标', '指示器', '鼠标'],
+    weakPhrases: ['指针', 'pointer'],
+  },
+  {
+    action: 'pen',
+    label: '标注模式',
+    phrases: ['标注模式', '打开标注', '开始标注', '画笔模式', '打开画笔', '批注模式', '写字模式', '画线'],
+    weakPhrases: ['标注', '画笔', '批注', '手写', '涂鸦', 'pen'],
+  },
+  {
+    action: 'zoom',
+    label: '区域放大',
+    phrases: ['区域放大', '局部放大', '打开放大', '放大模式', '放大镜', '缩放模式'],
+    weakPhrases: ['放大', '缩放', '区域', 'zoom'],
+  },
+  {
+    action: 'pause',
+    label: '暂停识别',
+    phrases: ['暂停识别', '暂停演示', '暂停播放', '暂停一下', '先暂停', '停一下', '停止识别'],
+    weakPhrases: ['暂停', 'pause'],
+  },
+  {
+    action: 'resume',
+    label: '继续识别',
+    phrases: ['继续识别', '恢复识别', '继续演示', '继续播放', '恢复播放', '接着讲', '继续讲'],
+    weakPhrases: ['继续', '恢复', '开始识别', 'resume'],
+  },
+  {
+    action: 'end',
+    label: '结束演示',
+    phrases: ['结束演示', '结束放映', '结束展示', '退出演示', '退出放映', '停止演示', '关闭演示'],
+    weakPhrases: ['结束吧', '退出吧', 'end'],
+  },
+  {
+    action: 'first',
+    label: '第一页',
+    phrases: ['第一页', '第一张', '回到第一页', '回到首页', '跳到第一页', '返回开头'],
+    weakPhrases: ['首页', '开头'],
+  },
+  {
+    action: 'last',
+    label: '最后一页',
+    phrases: ['最后一页', '最后一张', '跳到最后一页', '到最后一页', '放到最后'],
+    weakPhrases: ['尾页', '末页', '结尾'],
+  },
+  {
+    action: 'fullscreen',
+    label: '全屏放映',
+    phrases: ['进入全屏', '全屏放映', '开始放映', '放映模式', '全屏模式'],
+    weakPhrases: ['全屏'],
+  },
+  {
+    action: 'clear-annotations',
+    label: '清除标注',
+    phrases: ['清除标注', '清空标注', '擦除标注', '清除画笔', '清空画笔', '删除标注'],
+    weakPhrases: ['清屏'],
+  },
+  {
+    action: 'confirm-end',
+    label: '确认结束',
+    phrases: ['确认结束', '确定结束', '确认退出', '确定退出', '确认关闭'],
+    weakPhrases: ['确认', '确定'],
+  },
+  {
+    action: 'cancel-end',
+    label: '继续演示',
+    phrases: ['取消结束', '不要结束', '不结束', '别结束', '继续演示', '返回演示'],
+    weakPhrases: ['取消', '返回', '继续'],
+  },
+]
+
+function normaliseVoiceText(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/ppt|powerpoint/g, '演示')
+    .replace(/幻灯片|页面/g, '页')
+    .replace(/[\s,，.。!！?？:：;；、"'“”‘’`~·()（）[\]【】{}<>《》/\\|-]/g, '')
+}
+
+function phraseScore(command: string, phrase: string, strong: boolean) {
+  const normalisedPhrase = normaliseVoiceText(phrase)
+  if (!normalisedPhrase || !command.includes(normalisedPhrase)) return 0
+
+  const base = command === normalisedPhrase ? 5.4 : strong ? 4 : 2.35
+  const lengthBonus = Math.min(normalisedPhrase.length * (strong ? 0.14 : 0.08), strong ? 1.15 : 0.68)
+  const positionBonus = command.endsWith(normalisedPhrase) ? 0.16 : 0
+  return base + lengthBonus + positionBonus
+}
+
+function commandScore(pattern: VoiceCommandPattern, command: string) {
+  let score = 0
+  for (const phrase of pattern.phrases) {
+    score = Math.max(score, phraseScore(command, phrase, true))
+  }
+  for (const phrase of pattern.weakPhrases ?? []) {
+    score = Math.max(score, phraseScore(command, phrase, false))
+  }
+  for (const matcher of pattern.patterns ?? []) {
+    if (matcher.test(command)) score = Math.max(score, 3.85)
+  }
+  return score
+}
+
+function commandPoolForCurrentState() {
+  if (showEndConfirm.value) {
+    return VOICE_COMMANDS.filter((command) => command.action === 'confirm-end' || command.action === 'cancel-end')
+  }
+  return VOICE_COMMANDS.filter((command) => command.action !== 'confirm-end' && command.action !== 'cancel-end')
+}
+
+function matchVoiceCandidate(candidate: VoiceTranscriptCandidate): VoiceCommandMatch | null {
+  const command = normaliseVoiceText(candidate.text)
+  if (!command) return null
+
+  let best: VoiceCommandMatch | null = null
+  for (const pattern of commandPoolForCurrentState()) {
+    const score = commandScore(pattern, command)
+    if (score <= 0) continue
+
+    const confidenceBonus = candidate.confidence > 0 ? Math.min(candidate.confidence, 1) * 0.55 : 0
+    const finalBonus = candidate.isFinal ? 0.45 : 0
+    const match: VoiceCommandMatch = {
+      ...candidate,
+      action: pattern.action,
+      label: pattern.label,
+      score: score + confidenceBonus + finalBonus,
+    }
+    if (!best || match.score > best.score) best = match
+  }
+
+  return best
+}
+
+function collectVoiceCandidates(event: any): VoiceTranscriptCandidate[] {
+  const results = event?.results
+  if (!results?.length) return []
+
+  const startIndex = typeof event.resultIndex === 'number' ? event.resultIndex : Math.max(0, results.length - 1)
+  const candidates = new Map<string, VoiceTranscriptCandidate>()
+
+  for (let index = startIndex; index < results.length; index += 1) {
+    const result = results[index]
+    const alternativeCount = Math.min(Number(result?.length ?? 0), 3)
+    for (let alternativeIndex = 0; alternativeIndex < alternativeCount; alternativeIndex += 1) {
+      const alternative = result[alternativeIndex]
+      const text = String(alternative?.transcript ?? '').trim()
+      const key = normaliseVoiceText(text)
+      if (!key) continue
+
+      const candidate: VoiceTranscriptCandidate = {
+        text,
+        isFinal: Boolean(result?.isFinal),
+        confidence: typeof alternative?.confidence === 'number' ? alternative.confidence : 0,
+      }
+      const previous = candidates.get(key)
+      const previousRank = previous ? Number(previous.isFinal) * 2 + previous.confidence : -1
+      const candidateRank = Number(candidate.isFinal) * 2 + candidate.confidence
+      if (!previous || candidateRank >= previousRank) candidates.set(key, candidate)
+    }
+  }
+
+  return Array.from(candidates.values()).sort((left, right) => {
+    if (left.isFinal !== right.isFinal) return Number(right.isFinal) - Number(left.isFinal)
+    if (left.confidence !== right.confidence) return right.confidence - left.confidence
+    return right.text.length - left.text.length
+  })
+}
+
+function bestVoiceMatch(candidates: VoiceTranscriptCandidate[]) {
+  return candidates
+    .map((candidate) => matchVoiceCandidate(candidate))
+    .filter((match): match is VoiceCommandMatch => Boolean(match))
+    .sort((left, right) => right.score - left.score)[0] ?? null
+}
+
+function isReliableVoiceMatch(match: VoiceCommandMatch) {
+  if (!match.isFinal && !VOICE_INTERIM_FAST_ACTIONS.has(match.action)) return false
+  return match.score >= (match.isFinal ? VOICE_FINAL_SCORE_THRESHOLD : VOICE_INTERIM_SCORE_THRESHOLD)
+}
+
+function voiceActionCooldown(action: VoiceAction) {
+  if (action === 'next' || action === 'previous') return 650
+  if (action === 'end' || action === 'confirm-end' || action === 'cancel-end') return 1200
+  if (action === 'pause' || action === 'resume') return 520
+  return 460
+}
+
+function runVoiceAction(match: VoiceCommandMatch) {
+  const now = Date.now()
+  if (lastVoiceAction === match.action && now - lastVoiceActionAt < voiceActionCooldown(match.action)) return
+
+  lastVoiceAction = match.action
+  lastVoiceActionAt = now
+  lastVoiceText.value = match.label
+
+  if (match.action === 'cancel-end') {
+    cancelEndPresentation()
+    return
+  }
+
+  executeCommand(match.action, 'voice')
+}
+
+function runBackendVoiceAction(match: BackendVoiceMatch) {
+  if (!match.action || !match.label) return
+  runVoiceAction({
+    text: match.text ?? match.label,
+    isFinal: Boolean(match.isFinal),
+    confidence: 1,
+    action: match.action,
+    label: match.label,
+    score: match.score,
+  })
+}
+
+async function recogniseVoiceOnBackend(candidates: VoiceTranscriptCandidate[]) {
+  const response = await fetch(`${apiBase}/api/voice/recognize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      candidates,
+      showEndConfirm: showEndConfirm.value,
+    }),
+  })
+  if (!response.ok) throw new Error('voice recognition failed')
+  return (await response.json()) as BackendVoiceMatch
+}
+
+async function handleVoiceCandidates(candidates: VoiceTranscriptCandidate[]) {
+  if (!candidates.length) return
+
+  const serial = ++voiceRequestSerial
+  try {
+    const backendMatch = await recogniseVoiceOnBackend(candidates)
+    if (serial !== voiceRequestSerial) return
+
+    const backendLabel = backendMatch.label ?? candidates[0].text
+    lastVoiceText.value = `${backendLabel}${backendMatch.isFinal === false ? '...' : ''}`
+    if (backendMatch.matched) runBackendVoiceAction(backendMatch)
+    return
+  } catch {
+    // Fall back to local command matching when the backend is unavailable.
+  }
+
+  const match = bestVoiceMatch(candidates)
+  const fallback = candidates[0]
+  if (!match) {
+    lastVoiceText.value = `${fallback.text}${fallback.isFinal ? '' : '...'}`
+    return
+  }
+
+  lastVoiceText.value = `${match.label}${match.isFinal ? '' : '...'}`
+  if (isReliableVoiceMatch(match)) runVoiceAction(match)
 }
 
 const currentSlide = computed(() => deck.value?.slides[currentIndex.value] ?? null)
@@ -423,15 +772,19 @@ function nextSlide() {
   goToSlide(currentIndex.value + 1)
 }
 
-function executeCommand(action: string, source: 'gesture' | 'voice' | 'button' = 'button') {
+function executeCommand(action: CommandAction, source: CommandSource = 'button') {
   const now = Date.now()
   const needsCooldown = action === 'next' || action === 'previous'
-  const commandCooldownMs = source === 'gesture' ? 5000 : 950
+  const commandCooldownMs = source === 'gesture' ? 5000 : source === 'voice' ? 620 : 950
   if (needsCooldown && now - lastCommandAt < commandCooldownMs) return
   if (needsCooldown) lastCommandAt = now
 
   if (action === 'next') nextSlide()
   if (action === 'previous') previousSlide()
+  if (action === 'first') goToSlide(0)
+  if (action === 'last') goToSlide(slideCount.value - 1)
+  if (action === 'fullscreen') void enterFullscreen()
+  if (action === 'clear-annotations') clearAnnotations()
   if (action === 'pointer') activeMode.value = 'pointer'
   if (action === 'pen') activeMode.value = 'pen'
   if (action === 'zoom') activeMode.value = 'zoom'
@@ -758,20 +1111,35 @@ function startVoice() {
   const recognition = new Recognition()
   recognition.lang = 'zh-CN'
   recognition.continuous = true
-  recognition.interimResults = false
+  recognition.interimResults = true
+  recognition.maxAlternatives = 3
   recognition.onresult = (event: any) => {
-    const results = Array.from(event.results ?? []) as any[]
-    const lastResult = results[results.length - 1]
-    const transcript = lastResult?.[0]?.transcript?.trim()
-    if (!transcript) return
-    lastVoiceText.value = transcript
-    handleVoiceCommand(transcript)
+    void handleVoiceCandidates(collectVoiceCandidates(event))
   }
-  recognition.onerror = () => {
+  recognition.onaudiostart = () => {
+    lastVoiceText.value = '正在聆听'
+  }
+  recognition.onspeechstart = () => {
+    lastVoiceText.value = '识别中'
+  }
+  recognition.onspeechend = () => {
+    if (voiceEnabled.value) lastVoiceText.value = '正在判断'
+  }
+  recognition.onerror = (event: any) => {
+    const error = String(event?.error ?? '')
+    if (error === 'no-speech') {
+      lastVoiceText.value = '正在聆听'
+      return
+    }
+    if (error === 'not-allowed' || error === 'service-not-allowed') {
+      voiceEnabled.value = false
+      lastVoiceText.value = '麦克风权限受限'
+      return
+    }
     lastVoiceText.value = '语音识别异常'
   }
   recognition.onend = () => {
-    if (voiceEnabled.value) {
+    if (voiceEnabled.value && !ignoreVoiceEndRestart) {
       try {
         recognition.start()
       } catch {
@@ -782,31 +1150,28 @@ function startVoice() {
 
   speechRecognition.value = recognition
   voiceEnabled.value = true
+  ignoreVoiceEndRestart = false
   lastVoiceText.value = '正在聆听'
-  recognition.start()
+  try {
+    recognition.start()
+  } catch {
+    voiceEnabled.value = false
+    lastVoiceText.value = '语音启动失败'
+  }
 }
 
 function stopVoice() {
+  ignoreVoiceEndRestart = true
   voiceEnabled.value = false
   speechRecognition.value?.stop()
   speechRecognition.value = null
+  lastVoiceAction = ''
+  lastVoiceActionAt = 0
   lastVoiceText.value = '等待语音'
 }
 
 function handleVoiceCommand(text: string) {
-  const command = text.replace(/\s/g, '')
-  if (showEndConfirm.value && (command.includes('确认结束') || command.includes('确认'))) {
-    executeCommand('confirm-end', 'voice')
-    return
-  }
-  if (command.includes('下一页') || command.includes('下页')) executeCommand('next', 'voice')
-  if (command.includes('上一页') || command.includes('上页')) executeCommand('previous', 'voice')
-  if (command.includes('空气指针') || command.includes('打开指针') || command.includes('指针')) executeCommand('pointer', 'voice')
-  if (command.includes('标注') || command.includes('画笔')) executeCommand('pen', 'voice')
-  if (command.includes('放大') || command.includes('区域')) executeCommand('zoom', 'voice')
-  if (command.includes('暂停')) executeCommand('pause', 'voice')
-  if (command.includes('继续')) executeCommand('resume', 'voice')
-  if (command.includes('结束演示') || command.includes('结束放映')) executeCommand('end', 'voice')
+  void handleVoiceCandidates([{ text, isFinal: true, confidence: 1 }])
 }
 
 function stagePoint(event: PointerEvent): Point {
