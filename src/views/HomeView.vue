@@ -81,10 +81,14 @@ type VisionResult = {
     handSource?: string | null
     pageTurnCooldownSeconds?: number
     pageTurnPoseMatched?: boolean
+    pageTurnHoldGrace?: boolean
     pageTurnHoldProgress?: number
     pageTurnHoldSeconds?: number
     pageTurnArmed?: boolean
     pageTurnCooldownRemaining?: number
+    pageTurnSwipeDirection?: 'left' | 'right' | null
+    pageTurnSwipeDelta?: number | null
+    pageTurnSwipeVelocity?: number | null
   } | null
 }
 
@@ -110,21 +114,6 @@ type CommandAction =
   | 'fullscreen'
   | 'clear-annotations'
 type VoiceAction = CommandAction | 'cancel-end'
-
-type SpeechRecognitionLike = {
-  lang: string
-  continuous: boolean
-  interimResults: boolean
-  maxAlternatives?: number
-  onresult: ((event: any) => void) | null
-  onend: (() => void) | null
-  onerror: ((event: any) => void) | null
-  onaudiostart?: (() => void) | null
-  onspeechstart?: (() => void) | null
-  onspeechend?: (() => void) | null
-  start: () => void
-  stop: () => void
-}
 
 type VoiceCommandPattern = {
   action: VoiceAction
@@ -163,11 +152,12 @@ type BackendVoiceMatch = {
   }>
 }
 
-declare global {
-  interface Window {
-    SpeechRecognition?: new () => SpeechRecognitionLike
-    webkitSpeechRecognition?: new () => SpeechRecognitionLike
-  }
+type ExternalControlResult = {
+  action: string
+  executed: boolean
+  method: string
+  detail?: string | null
+  platform?: string
 }
 
 const apiBase = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
@@ -205,14 +195,15 @@ const drawingLine = ref<AnnotationLine | null>(null)
 const voiceEnabled = ref(false)
 const voiceSupported = ref(true)
 const lastVoiceText = ref('等待语音')
-const speechRecognition = ref<SpeechRecognitionLike | null>(null)
+const lastVoiceError = ref('')
 const showEndConfirm = ref(false)
 const pendingEndByVoice = ref(false)
 const showSettings = ref(false)
 const externalControlEnabled = ref(false)
+const externalControlStatus = ref('外部控制待检测')
 const visionSettings = ref<VisionSettings>({
   cooldownSeconds: 5,
-  swipeThreshold: 0.14,
+  swipeThreshold: 0.02,
   confidenceThreshold: 0.45,
 })
 
@@ -223,10 +214,17 @@ let annotationId = 0
 let lastCommandAt = 0
 let lastVoiceAction = ''
 let lastVoiceActionAt = 0
-let ignoreVoiceEndRestart = false
 let voiceRequestSerial = 0
 let visionRequestInFlight = false
 let lastFaceDetectedAt = 0
+let voiceStream: MediaStream | null = null
+let voiceAudioContext: AudioContext | null = null
+let voiceProcessor: ScriptProcessorNode | null = null
+let voiceSource: MediaStreamAudioSourceNode | null = null
+let voiceChunks: Float32Array[] = []
+let voiceChunkSampleCount = 0
+let voiceFlushTimerId: number | undefined
+let voiceRequestInFlight = false
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
@@ -561,18 +559,19 @@ const distanceText = computed(() => {
 const gestureText = computed(() => {
   const gesture = visionResult.value?.gesture
   if (gesture?.action === 'next') return '激活手势挥动：下一页'
-  if (visionResult.value?.debug?.pageTurnArmed) return '翻页模式已激活：挥手下一页'
+  if (gesture?.action === 'previous') return '激活手势挥动：上一页'
+  if (visionResult.value?.debug?.pageTurnArmed) return '翻页模式已激活：右挥下一页，左挥上一页'
   if (visionResult.value?.debug?.pageTurnPoseMatched) return '保持 1 秒后进入翻页模式'
   if (gesture?.action === 'pointer') return '指向：空气指针'
   if (!cameraEnabled.value) return '点击顶部摄像头后识别手势'
   if (activeMode.value === 'pen') return '标注模式：拖动画笔'
   if (activeMode.value === 'zoom') return '区域放大：移动定位'
-  return '食指中指伸出、无名指小指收起，保持 1 秒后挥手翻页'
+  return '食指中指伸出、无名指小指收起，保持 1 秒后左右挥手翻页'
 })
 const voiceText = computed(() => {
   if (!voiceSupported.value) return '语音：浏览器不支持'
   if (!voiceEnabled.value) return '语音：点击麦克风开启'
-  return `语音：${lastVoiceText.value}`
+  return `语音：${lastVoiceText.value}${lastVoiceError.value ? ` (${lastVoiceError.value})` : ''}`
 })
 const latencyText = computed(() => {
   if (recognitionPaused.value) return '识别已暂停'
@@ -641,8 +640,8 @@ const debugStatusText = computed(() => {
   if (!cameraEnabled.value) return '摄像头未开启'
   if (debug?.mediapipeAvailable === false) return 'MediaPipe 未加载'
   if (!visionResult.value?.hand) return '未检测到手'
-  if (debug?.pageTurnArmed) return '翻页模式'
-  if (debug?.pageTurnPoseMatched) return '保持姿势中'
+  if (debug?.pageTurnArmed) return '等待挥动'
+  if (debug?.pageTurnPoseMatched) return debug.pageTurnHoldGrace ? '保持容错中' : '保持姿势中'
   return '手部已检测'
 })
 const debugDetailText = computed(() => {
@@ -652,12 +651,15 @@ const debugDetailText = computed(() => {
   if (!cameraEnabled.value) return '开启摄像头后显示识别结果'
   if (!hand) return '把手放进摄像头画面，尽量保持掌心清晰'
   const holdText = debug?.pageTurnPoseMatched
-    ? ` · 保持 ${Math.round((debug.pageTurnHoldProgress ?? 0) * 100)}%`
+    ? ` · ${debug.pageTurnHoldGrace ? '容错保持' : '保持'} ${Math.round((debug.pageTurnHoldProgress ?? 0) * 100)}%`
     : ''
   const cooldownText = (debug?.pageTurnCooldownRemaining ?? 0) > 0
     ? ` · 冷却 ${debug?.pageTurnCooldownRemaining?.toFixed(1)}s`
     : ''
-  return `${hand.source || debug?.handSource || 'unknown'} · ${hand.pose} · ${(hand.confidence * 100).toFixed(0)}%${holdText}${cooldownText}`
+  const swipeText = debug?.pageTurnSwipeDelta
+    ? ` · 挥动 ${debug.pageTurnSwipeDirection || '-'} ${debug.pageTurnSwipeDelta.toFixed(2)}`
+    : ''
+  return `${hand.source || debug?.handSource || 'unknown'} · ${hand.pose} · ${(hand.confidence * 100).toFixed(0)}%${holdText}${swipeText}${cooldownText}`
 })
 
 const processSteps = [
@@ -765,16 +767,32 @@ function goToSlide(index: number) {
 }
 
 function previousSlide() {
-  goToSlide(currentIndex.value - 1)
+  goToSlide((hasDeck.value ? currentIndex.value : demoIndex.value) - 1)
 }
 
 function nextSlide() {
-  goToSlide(currentIndex.value + 1)
+  goToSlide((hasDeck.value ? currentIndex.value : demoIndex.value) + 1)
+}
+
+function canTurnSlide(action: CommandAction) {
+  if (action === 'previous') return (hasDeck.value ? currentIndex.value : demoIndex.value) > 0
+  if (action === 'next') return (hasDeck.value ? currentIndex.value : demoIndex.value) < slideCount.value - 1
+  return true
+}
+
+function externalControlAction(action: CommandAction) {
+  if (action === 'confirm-end') return 'end'
+  if (action === 'resume') return 'resume'
+  if (action === 'fullscreen') return 'fullscreen'
+  if (['next', 'previous', 'first', 'last', 'pause', 'end'].includes(action)) return action
+  return null
 }
 
 function executeCommand(action: CommandAction, source: CommandSource = 'button') {
   const now = Date.now()
   const needsCooldown = action === 'next' || action === 'previous'
+  if (needsCooldown && !canTurnSlide(action)) return
+
   const commandCooldownMs = source === 'gesture' ? 5000 : source === 'voice' ? 620 : 950
   if (needsCooldown && now - lastCommandAt < commandCooldownMs) return
   if (needsCooldown) lastCommandAt = now
@@ -796,20 +814,50 @@ function executeCommand(action: CommandAction, source: CommandSource = 'button')
   }
   if (action === 'confirm-end') confirmEndPresentation()
 
-  if (externalControlEnabled.value && ['next', 'previous', 'start', 'end', 'pause'].includes(action)) {
-    void sendExternalControl(action)
+  const externalAction = externalControlAction(action)
+  if (externalControlEnabled.value && externalAction) {
+    void sendExternalControl(externalAction)
   }
 }
 
 async function sendExternalControl(action: string) {
   try {
-    await fetch(`${apiBase}/api/presentation/control`, {
+    const response = await fetch(`${apiBase}/api/presentation/control`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action }),
     })
+    if (!response.ok) throw new Error('control request failed')
+    const result = (await response.json()) as ExternalControlResult
+    if (!result.executed) {
+      errorMessage.value = result.detail || '外部 PowerPoint 控制未执行，请确认放映窗口在前台'
+      return
+    }
+    errorMessage.value = ''
   } catch {
     errorMessage.value = '外部 PowerPoint 控制暂不可用'
+  }
+}
+
+async function loadExternalControlStatus() {
+  try {
+    const response = await fetch(`${apiBase}/api/presentation/control/status`)
+    if (!response.ok) throw new Error('control status failed')
+    const status = (await response.json()) as {
+      platform?: string
+      keyboardFallbackAvailable?: boolean
+      powerpointComAvailable?: boolean
+    }
+    const platform = status.platform || 'Unknown'
+    if (status.powerpointComAvailable) {
+      externalControlStatus.value = `${platform} · PowerPoint COM 可用`
+    } else if (status.keyboardFallbackAvailable) {
+      externalControlStatus.value = `${platform} · 系统按键控制可用`
+    } else {
+      externalControlStatus.value = `${platform} · 未检测到可用外部控制`
+    }
+  } catch {
+    externalControlStatus.value = '外部控制状态获取失败'
   }
 }
 
@@ -897,7 +945,7 @@ async function captureVisionFrame() {
     payload.latencyMs = payload.latencyMs || Math.round(performance.now() - startedAt)
     applyVisionResult(payload)
   } catch {
-    visionStatus.value = '??????'
+    visionStatus.value = '视觉请求失败，请检查后端服务'
   } finally {
     visionRequestInFlight = false
   }
@@ -1096,77 +1144,170 @@ function toggleVoice() {
   if (voiceEnabled.value) {
     stopVoice()
   } else {
-    startVoice()
+    void startVoice()
   }
 }
 
-function startVoice() {
-  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition
-  if (!Recognition) {
-    voiceSupported.value = false
-    lastVoiceText.value = '浏览器不支持语音识别'
-    return
-  }
+function encodeWav(samples: Float32Array, sampleRate: number) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2)
+  const view = new DataView(buffer)
+  writeAscii(view, 0, 'RIFF')
+  view.setUint32(4, 36 + samples.length * 2, true)
+  writeAscii(view, 8, 'WAVE')
+  writeAscii(view, 12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, 1, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * 2, true)
+  view.setUint16(32, 2, true)
+  view.setUint16(34, 16, true)
+  writeAscii(view, 36, 'data')
+  view.setUint32(40, samples.length * 2, true)
 
-  const recognition = new Recognition()
-  recognition.lang = 'zh-CN'
-  recognition.continuous = true
-  recognition.interimResults = true
-  recognition.maxAlternatives = 3
-  recognition.onresult = (event: any) => {
-    void handleVoiceCandidates(collectVoiceCandidates(event))
+  let offset = 44
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, samples[index]))
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true)
+    offset += 2
   }
-  recognition.onaudiostart = () => {
-    lastVoiceText.value = '正在聆听'
+  return new Blob([buffer], { type: 'audio/wav' })
+}
+
+function writeAscii(view: DataView, offset: number, text: string) {
+  for (let index = 0; index < text.length; index += 1) {
+    view.setUint8(offset + index, text.charCodeAt(index))
   }
-  recognition.onspeechstart = () => {
-    lastVoiceText.value = '识别中'
+}
+
+function resampleTo16k(input: Float32Array, sourceRate: number) {
+  const targetRate = 16000
+  if (sourceRate === targetRate) return input
+  const ratio = sourceRate / targetRate
+  const length = Math.max(1, Math.round(input.length / ratio))
+  const output = new Float32Array(length)
+  for (let index = 0; index < length; index += 1) {
+    const sourceIndex = index * ratio
+    const before = Math.floor(sourceIndex)
+    const after = Math.min(before + 1, input.length - 1)
+    const weight = sourceIndex - before
+    output[index] = input[before] * (1 - weight) + input[after] * weight
   }
-  recognition.onspeechend = () => {
-    if (voiceEnabled.value) lastVoiceText.value = '正在判断'
+  return output
+}
+
+function mergeVoiceChunks(chunks: Float32Array[], length: number) {
+  const merged = new Float32Array(length)
+  let offset = 0
+  for (const chunk of chunks) {
+    merged.set(chunk, offset)
+    offset += chunk.length
   }
-  recognition.onerror = (event: any) => {
-    const error = String(event?.error ?? '')
-    if (error === 'no-speech') {
+  return merged
+}
+
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(blob)
+  })
+}
+
+async function transcribeVoiceChunk(samples: Float32Array, sourceRate: number) {
+  if (voiceRequestInFlight || samples.length < sourceRate * 0.45) return
+  voiceRequestInFlight = true
+  try {
+    const wav = encodeWav(resampleTo16k(samples, sourceRate), 16000)
+    const data = await blobToDataUrl(wav)
+    const response = await fetch(`${apiBase}/api/voice/transcribe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data, showEndConfirm: showEndConfirm.value }),
+    })
+    if (!response.ok) throw new Error(await response.text())
+    const match = (await response.json()) as BackendVoiceMatch & { transcript?: string }
+    lastVoiceError.value = ''
+    if (match.transcript) {
+      lastVoiceText.value = match.matched ? match.label ?? match.transcript : match.transcript
+    } else {
       lastVoiceText.value = '正在聆听'
-      return
     }
-    if (error === 'not-allowed' || error === 'service-not-allowed') {
-      voiceEnabled.value = false
-      lastVoiceText.value = '麦克风权限受限'
-      return
-    }
-    lastVoiceText.value = '语音识别异常'
+    if (match.matched) runBackendVoiceAction(match)
+  } catch (exc) {
+    lastVoiceError.value = exc instanceof Error ? exc.message.slice(0, 60) : 'transcribe-failed'
+    lastVoiceText.value = '本地语音识别失败'
+  } finally {
+    voiceRequestInFlight = false
   }
-  recognition.onend = () => {
-    if (voiceEnabled.value && !ignoreVoiceEndRestart) {
-      try {
-        recognition.start()
-      } catch {
-        voiceEnabled.value = false
-      }
-    }
-  }
+}
 
-  speechRecognition.value = recognition
-  voiceEnabled.value = true
-  ignoreVoiceEndRestart = false
+function flushVoiceChunk() {
+  if (!voiceAudioContext || !voiceChunks.length) return
+  const chunks = voiceChunks
+  const length = voiceChunkSampleCount
+  const sampleRate = voiceAudioContext.sampleRate
+  voiceChunks = []
+  voiceChunkSampleCount = 0
+  void transcribeVoiceChunk(mergeVoiceChunks(chunks, length), sampleRate)
+}
+
+async function startVoice() {
+  lastVoiceError.value = ''
   lastVoiceText.value = '正在聆听'
   try {
-    recognition.start()
-  } catch {
+    voiceStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: false,
+    })
+    voiceAudioContext = new AudioContext()
+    voiceSource = voiceAudioContext.createMediaStreamSource(voiceStream)
+    voiceProcessor = voiceAudioContext.createScriptProcessor(4096, 1, 1)
+    voiceProcessor.onaudioprocess = (event) => {
+      if (!voiceEnabled.value) return
+      const input = event.inputBuffer.getChannelData(0)
+      voiceChunks.push(new Float32Array(input))
+      voiceChunkSampleCount += input.length
+    }
+    voiceSource.connect(voiceProcessor)
+    voiceProcessor.connect(voiceAudioContext.destination)
+    voiceFlushTimerId = window.setInterval(flushVoiceChunk, 1800)
+    voiceEnabled.value = true
+    voiceSupported.value = true
+  } catch (exc) {
     voiceEnabled.value = false
-    lastVoiceText.value = '语音启动失败'
+    lastVoiceError.value = exc instanceof Error ? exc.name : 'start-failed'
+    lastVoiceText.value = '麦克风启动失败'
   }
 }
 
 function stopVoice() {
-  ignoreVoiceEndRestart = true
   voiceEnabled.value = false
-  speechRecognition.value?.stop()
-  speechRecognition.value = null
+  if (voiceFlushTimerId !== undefined) {
+    window.clearInterval(voiceFlushTimerId)
+    voiceFlushTimerId = undefined
+  }
+  flushVoiceChunk()
+  voiceProcessor?.disconnect()
+  voiceSource?.disconnect()
+  void voiceAudioContext?.close()
+  voiceStream?.getTracks().forEach((track) => track.stop())
+  voiceProcessor = null
+  voiceSource = null
+  voiceAudioContext = null
+  voiceStream = null
+  voiceChunks = []
+  voiceChunkSampleCount = 0
+  voiceRequestInFlight = false
   lastVoiceAction = ''
   lastVoiceActionAt = 0
+  lastVoiceError.value = ''
   lastVoiceText.value = '等待语音'
 }
 
@@ -1242,29 +1383,30 @@ function handleKeydown(event: KeyboardEvent) {
 
   if (event.key === 'ArrowRight' || event.key === 'PageDown' || event.key === ' ') {
     event.preventDefault()
-    nextSlide()
+    executeCommand('next', 'button')
   }
   if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
     event.preventDefault()
-    previousSlide()
+    executeCommand('previous', 'button')
   }
   if (event.key === 'Home') {
     event.preventDefault()
-    goToSlide(0)
+    executeCommand('first', 'button')
   }
-  if (event.key === 'End' && deck.value) {
+  if (event.key === 'End') {
     event.preventDefault()
-    goToSlide(deck.value.slideCount - 1)
+    executeCommand('last', 'button')
   }
   if (event.key.toLowerCase() === 'f') {
     event.preventDefault()
-    void enterFullscreen()
+    executeCommand('fullscreen', 'button')
   }
 }
 
 onMounted(() => {
   window.addEventListener('keydown', handleKeydown)
   void loadVisionSettings()
+  void loadExternalControlStatus()
   timerId = window.setInterval(() => {
     if (!recognitionPaused.value) elapsedSeconds.value += 1
   }, 1000)
@@ -1516,7 +1658,7 @@ onBeforeUnmount(() => {
       </button>
 
       <nav class="tool-strip">
-        <button class="tool-button" type="button" :disabled="hasDeck ? currentIndex === 0 : demoIndex === 0" @click="previousSlide">
+        <button class="tool-button" type="button" :disabled="hasDeck ? currentIndex === 0 : demoIndex === 0" @click="executeCommand('previous')">
           <ArrowLeft :size="34" />
           <span>上一页</span>
         </button>
@@ -1524,24 +1666,24 @@ onBeforeUnmount(() => {
           class="tool-button"
           type="button"
           :disabled="hasDeck ? currentIndex >= (deck?.slideCount ?? 1) - 1 : demoIndex >= slideCount - 1"
-          @click="nextSlide"
+          @click="executeCommand('next')"
         >
           <ArrowRight :size="34" />
           <span>下一页</span>
         </button>
-        <button class="tool-button" :class="{ active: activeMode === 'pointer' }" type="button" @click="activeMode = 'pointer'">
+        <button class="tool-button" :class="{ active: activeMode === 'pointer' }" type="button" @click="executeCommand('pointer')">
           <Hand :size="33" />
           <span>空气指针</span>
         </button>
-        <button class="tool-button" :class="{ selected: activeMode === 'pen' }" type="button" @click="activeMode = 'pen'" @dblclick="clearAnnotations">
+        <button class="tool-button" :class="{ selected: activeMode === 'pen' }" type="button" @click="executeCommand('pen')" @dblclick="executeCommand('clear-annotations')">
           <PenLine :size="32" />
           <span>标注</span>
         </button>
-        <button class="tool-button" :class="{ selected: activeMode === 'zoom' }" type="button" @click="activeMode = 'zoom'">
+        <button class="tool-button" :class="{ selected: activeMode === 'zoom' }" type="button" @click="executeCommand('zoom')">
           <Expand :size="32" />
           <span>区域放大</span>
         </button>
-        <button class="tool-button" type="button" @click="recognitionPaused = !recognitionPaused">
+        <button class="tool-button" type="button" @click="executeCommand(recognitionPaused ? 'resume' : 'pause')">
           <Pause :size="34" />
           <span>{{ recognitionPaused ? '继续识别' : '暂停识别' }}</span>
         </button>
@@ -1554,7 +1696,7 @@ onBeforeUnmount(() => {
       <div class="footer-meta">
         <span>{{ conversionLabel }}</span>
         <b>{{ displayIndex }} / {{ slideCount }}</b>
-        <button type="button" @click="enterFullscreen">全屏</button>
+        <button type="button" @click="executeCommand('fullscreen')">全屏</button>
       </div>
     </footer>
 
@@ -1596,8 +1738,8 @@ onBeforeUnmount(() => {
             滑动触发阈值
             <small>数值越小越灵敏，越大越稳定</small>
           </span>
-          <input v-model.number="visionSettings.swipeThreshold" min="0.08" max="0.5" step="0.01" type="range" />
-          <b>{{ visionSettings.swipeThreshold.toFixed(2) }}</b>
+          <input v-model.number="visionSettings.swipeThreshold" min="0.005" max="0.08" step="0.005" type="range" />
+          <b>{{ visionSettings.swipeThreshold.toFixed(3) }}</b>
         </label>
 
         <label class="setting-row">
@@ -1612,7 +1754,7 @@ onBeforeUnmount(() => {
         <label class="toggle-row">
           <span>
             控制外部 PowerPoint
-            <small>开启后会通过 Python 调用 PowerPoint COM，失败时用系统按键兜底</small>
+            <small>{{ externalControlStatus }}，开启后命令会同步发送给前台放映窗口</small>
           </span>
           <input v-model="externalControlEnabled" type="checkbox" />
         </label>
@@ -1628,9 +1770,27 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .prototype-shell {
+  --space-2xs: clamp(3px, min(0.28vw, 0.5vh), 6px);
+  --space-xs: clamp(5px, min(0.45vw, 0.75vh), 9px);
+  --space-sm: clamp(8px, min(0.65vw, 1vh), 13px);
+  --space-md: clamp(10px, min(0.95vw, 1.35vh), 18px);
+  --space-lg: clamp(14px, min(1.35vw, 1.8vh), 26px);
+  --font-xs: clamp(10px, min(0.66vw, 1.12vh), 13px);
+  --font-sm: clamp(12px, min(0.78vw, 1.28vh), 15px);
+  --font-md: clamp(13px, min(0.95vw, 1.5vh), 18px);
+  --font-lg: clamp(15px, min(1.12vw, 1.75vh), 22px);
+  --font-xl: clamp(20px, min(2.1vw, 3.2vh), 40px);
+  --chrome-top: clamp(48px, min(3.5vw, 7.2vh), 64px);
+  --chrome-bottom: clamp(64px, min(5.2vw, 10.8vh), 96px);
+  --stage-pad: clamp(8px, min(1vw, 1.8vh), 16px);
+  --icon-sm: clamp(16px, min(1.25vw, 2.1vh), 22px);
+  --icon-md: clamp(20px, min(1.8vw, 3vh), 34px);
+  --panel-radius: clamp(6px, min(0.6vw, 1vh), 10px);
   display: grid;
-  min-height: 100vh;
-  grid-template-rows: 64px minmax(0, 1fr) 96px;
+  height: 100vh;
+  height: 100dvh;
+  min-height: 520px;
+  grid-template-rows: minmax(var(--chrome-top), auto) minmax(0, 1fr) minmax(var(--chrome-bottom), auto);
   overflow: hidden;
   background:
     radial-gradient(circle at 50% 20%, rgb(40 67 104 / 0.2), transparent 42%),
@@ -1658,9 +1818,10 @@ onBeforeUnmount(() => {
 
 .top-bar {
   justify-content: space-between;
-  gap: 24px;
+  gap: var(--space-md);
   border-bottom: 1px solid rgb(255 255 255 / 0.09);
-  padding: 0 28px;
+  padding: 0 var(--space-lg);
+  min-width: 0;
 }
 
 .brand-zone,
@@ -1676,19 +1837,45 @@ onBeforeUnmount(() => {
   align-items: center;
 }
 
+.top-bar svg,
+.file-title svg,
+.device-zone svg {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+}
+
+.tool-button svg,
+.collapse-button svg {
+  width: var(--icon-md);
+  height: var(--icon-md);
+}
+
+.assist-card svg,
+.quick-upload svg {
+  width: var(--icon-sm);
+  height: var(--icon-sm);
+  flex: 0 0 auto;
+}
+
+.step-icon svg {
+  width: clamp(38px, min(4.2vw, 7vh), 76px);
+  height: clamp(38px, min(4.2vw, 7vh), 76px);
+}
+
 .brand-zone {
-  min-width: 370px;
-  gap: 16px;
+  flex: 1 1 260px;
+  min-width: 0;
+  gap: var(--space-md);
 }
 
 .app-logo {
   display: flex;
-  width: 40px;
-  height: 40px;
+  width: clamp(30px, min(2.4vw, 4.6vh), 40px);
+  height: clamp(30px, min(2.4vw, 4.6vh), 40px);
   align-items: center;
   justify-content: center;
   gap: 2px;
-  border-radius: 10px;
+  border-radius: var(--panel-radius);
   background: linear-gradient(135deg, #2d91ff, #275de8);
   box-shadow: 0 12px 26px rgb(45 125 255 / 0.34);
 }
@@ -1714,23 +1901,25 @@ onBeforeUnmount(() => {
 }
 
 .brand-zone h1 {
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 20px;
+  font-size: var(--font-lg);
   font-weight: 700;
   letter-spacing: 0;
 }
 
 .divider {
   width: 1px;
-  height: 28px;
+  height: clamp(20px, min(1.8vw, 3.5vh), 28px);
   background: rgb(255 255 255 / 0.13);
 }
 
 .live-state {
-  gap: 10px;
+  gap: var(--space-sm);
   white-space: nowrap;
   color: #d8e2f0;
-  font-size: 17px;
+  font-size: var(--font-md);
 }
 
 .live-state i,
@@ -1744,14 +1933,15 @@ onBeforeUnmount(() => {
 }
 
 .file-title {
+  flex: 1 1 280px;
   max-width: 580px;
-  min-width: 340px;
+  min-width: 0;
   justify-content: center;
-  gap: 8px;
+  gap: var(--space-xs);
   border: 0;
   background: transparent;
   color: #e8eef8;
-  font-size: 18px;
+  font-size: var(--font-md);
   cursor: pointer;
 }
 
@@ -1762,9 +1952,10 @@ onBeforeUnmount(() => {
 }
 
 .device-zone {
+  flex: 1 1 330px;
   justify-content: flex-end;
-  gap: 18px;
-  min-width: 490px;
+  gap: var(--space-md);
+  min-width: 0;
   color: #d4deec;
 }
 
@@ -1772,7 +1963,7 @@ onBeforeUnmount(() => {
 .camera-toggle,
 .settings-button,
 .upload-button {
-  gap: 8px;
+  gap: var(--space-xs);
   border: 0;
   background: transparent;
   color: inherit;
@@ -1810,30 +2001,32 @@ onBeforeUnmount(() => {
 }
 
 .upload-button {
-  height: 34px;
-  padding: 0 12px;
+  height: clamp(30px, min(2.2vw, 4.2vh), 38px);
+  padding: 0 var(--space-sm);
   border: 1px solid rgb(255 255 255 / 0.14);
-  border-radius: 8px;
+  border-radius: var(--panel-radius);
   background: rgb(255 255 255 / 0.06);
 }
 
 .window-actions {
-  gap: 18px;
+  gap: var(--space-md);
   color: #cfd9e8;
 }
 
 .stage-area {
+  --stage-max-height: calc(100dvh - var(--chrome-top) - var(--chrome-bottom) - var(--stage-pad) * 2);
   display: flex;
   min-height: 0;
   align-items: center;
   justify-content: center;
-  padding: 16px;
+  padding: var(--stage-pad);
   background: linear-gradient(180deg, #07111f 0%, #0f1b2a 100%);
 }
 
 .presentation-stage {
   position: relative;
-  width: min(100%, 1880px);
+  width: min(100%, 1880px, calc(var(--stage-max-height) * 16 / 9));
+  max-height: var(--stage-max-height);
   aspect-ratio: 16 / 9;
   overflow: hidden;
   border: 1px solid rgb(255 255 255 / 0.2);
@@ -1879,8 +2072,8 @@ onBeforeUnmount(() => {
 .air-pointer {
   position: absolute;
   z-index: 5;
-  width: 26px;
-  height: 26px;
+  width: clamp(16px, min(1.5vw, 2.6vh), 26px);
+  height: clamp(16px, min(1.5vw, 2.6vh), 26px);
   transform: translate(-50%, -50%);
   border: 3px solid white;
   border-radius: 999px;
@@ -1893,9 +2086,9 @@ onBeforeUnmount(() => {
 
 .air-pointer span {
   position: absolute;
-  left: 19px;
-  top: 19px;
-  width: 92px;
+  left: 72%;
+  top: 72%;
+  width: clamp(48px, min(5vw, 8vh), 92px);
   height: 3px;
   transform: rotate(28deg);
   transform-origin: left center;
@@ -1906,11 +2099,11 @@ onBeforeUnmount(() => {
 .zoom-window {
   position: absolute;
   z-index: 6;
-  width: 252px;
-  height: 158px;
+  width: clamp(150px, min(14vw, 24vh), 252px);
+  height: clamp(94px, min(8.8vw, 15vh), 158px);
   overflow: hidden;
   border: 2px solid rgb(43 132 255 / 0.95);
-  border-radius: 10px;
+  border-radius: var(--panel-radius);
   background: rgb(243 248 255 / 0.96);
   box-shadow: 0 24px 54px rgb(21 67 140 / 0.26);
   pointer-events: none;
@@ -1937,8 +2130,8 @@ onBeforeUnmount(() => {
   border-radius: 999px;
   background: rgb(16 40 76 / 0.7);
   color: white;
-  padding: 3px 8px;
-  font-size: 12px;
+  padding: var(--space-2xs) var(--space-xs);
+  font-size: var(--font-xs);
 }
 
 .demo-slide {
@@ -1980,14 +2173,14 @@ onBeforeUnmount(() => {
 }
 
 .slide-heading {
-  padding-top: 86px;
+  padding-top: clamp(34px, min(4.8vw, 8vh), 86px);
   text-align: center;
 }
 
 .slide-heading h2 {
   margin: 0;
   color: #102849;
-  font-size: clamp(38px, 4.1vw, 72px);
+  font-size: clamp(26px, min(4.1vw, 7.5vh), 72px);
   font-weight: 800;
   line-height: 1;
   letter-spacing: 0;
@@ -1995,9 +2188,9 @@ onBeforeUnmount(() => {
 
 .slide-heading span {
   display: block;
-  width: 76px;
-  height: 5px;
-  margin: 24px auto 28px;
+  width: clamp(42px, min(4.2vw, 7vh), 76px);
+  height: clamp(3px, min(0.3vw, 0.6vh), 5px);
+  margin: clamp(12px, min(1.3vw, 2.4vh), 24px) auto clamp(14px, min(1.5vw, 2.8vh), 28px);
   border-radius: 999px;
   background: linear-gradient(90deg, #1f7fff, #6da4ff);
 }
@@ -2006,16 +2199,16 @@ onBeforeUnmount(() => {
   margin: 0 auto;
   max-width: 980px;
   color: #50627a;
-  font-size: clamp(15px, 1.08vw, 21px);
+  font-size: clamp(12px, min(1.08vw, 2vh), 21px);
   font-weight: 500;
 }
 
 .process-row {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 34px;
+  gap: clamp(8px, min(1.9vw, 3.2vh), 34px);
   width: min(88%, 1640px);
-  margin: clamp(58px, 7vw, 96px) auto 0;
+  margin: clamp(28px, min(5.4vw, 8.8vh), 96px) auto 0;
 }
 
 .process-step {
@@ -2026,8 +2219,8 @@ onBeforeUnmount(() => {
 .step-icon {
   position: relative;
   display: grid;
-  width: clamp(120px, 9.6vw, 192px);
-  height: clamp(120px, 9.6vw, 192px);
+  width: clamp(68px, min(9.6vw, 15.5vh), 192px);
+  height: clamp(68px, min(9.6vw, 15.5vh), 192px);
   place-items: center;
   margin: 0 auto;
   border: 2px solid #78a8ff;
@@ -2042,29 +2235,29 @@ onBeforeUnmount(() => {
   left: -8px;
   top: -12px;
   display: grid;
-  width: 44px;
-  height: 44px;
+  width: clamp(26px, min(2.5vw, 4.2vh), 44px);
+  height: clamp(26px, min(2.5vw, 4.2vh), 44px);
   place-items: center;
   border-radius: 999px;
   background: linear-gradient(180deg, #1f84ff, #2867d9);
   color: white;
-  font-size: 22px;
+  font-size: clamp(12px, min(1.25vw, 2.2vh), 22px);
   line-height: 1;
   box-shadow: 0 8px 18px rgb(32 117 228 / 0.28);
 }
 
 .process-step h3 {
-  margin: 26px 0 0;
+  margin: clamp(10px, min(1.45vw, 2.6vh), 26px) 0 0;
   color: #102849;
-  font-size: clamp(17px, 1.25vw, 24px);
+  font-size: clamp(12px, min(1.25vw, 2.25vh), 24px);
   font-weight: 800;
   line-height: 1.25;
 }
 
 .process-step p {
-  margin: 15px 0 0;
+  margin: clamp(6px, min(0.8vw, 1.5vh), 15px) 0 0;
   color: #68758a;
-  font-size: clamp(14px, 1.05vw, 21px);
+  font-size: clamp(11px, min(1.05vw, 1.9vh), 21px);
   line-height: 1.7;
 }
 
@@ -2074,10 +2267,10 @@ onBeforeUnmount(() => {
 
 .step-arrow {
   position: absolute;
-  left: calc(50% + 98px);
-  top: 84px;
+  left: calc(50% + clamp(40px, min(5vw, 8vh), 98px));
+  top: clamp(34px, min(4.2vw, 7vh), 84px);
   display: flex;
-  width: 122px;
+  width: clamp(38px, min(6vw, 10vh), 122px);
   align-items: center;
   color: #2e7af0;
 }
@@ -2136,8 +2329,8 @@ onBeforeUnmount(() => {
   position: absolute;
   right: 17.5%;
   bottom: 25%;
-  width: 168px;
-  height: 118px;
+  width: clamp(72px, min(9vw, 15vh), 168px);
+  height: clamp(52px, min(6.2vw, 10.5vh), 118px);
   overflow: visible;
 }
 
@@ -2157,13 +2350,13 @@ onBeforeUnmount(() => {
 
 .camera-preview {
   position: absolute;
-  left: 24px;
-  top: 22px;
+  left: var(--space-lg);
+  top: var(--space-lg);
   z-index: 6;
-  width: clamp(220px, 15.5vw, 292px);
-  height: clamp(112px, 8.1vw, 154px);
+  width: clamp(148px, min(15.5vw, 26vh), 292px);
+  height: clamp(76px, min(8.1vw, 13.6vh), 154px);
   overflow: hidden;
-  border-radius: 10px;
+  border-radius: var(--panel-radius);
   background: rgb(55 65 78 / 0.75);
   box-shadow: 0 18px 42px rgb(23 46 79 / 0.18);
   backdrop-filter: blur(12px);
@@ -2316,10 +2509,10 @@ onBeforeUnmount(() => {
   left: 58%;
   top: 50%;
   display: grid;
-  gap: 7px;
+  gap: var(--space-xs);
   transform: translateY(-50%);
   color: white;
-  font-size: clamp(13px, 0.95vw, 18px);
+  font-size: var(--font-sm);
   line-height: 1.25;
 }
 
@@ -2329,13 +2522,13 @@ onBeforeUnmount(() => {
 
 .hand-debug-panel {
   position: absolute;
-  right: 28px;
-  top: 22px;
+  right: var(--space-lg);
+  top: var(--space-lg);
   z-index: 7;
-  width: clamp(260px, 17vw, 326px);
+  width: clamp(190px, min(17vw, 28vh), 326px);
   overflow: hidden;
   border: 1px solid rgb(255 255 255 / 0.18);
-  border-radius: 10px;
+  border-radius: var(--panel-radius);
   background: rgb(13 27 47 / 0.78);
   color: white;
   box-shadow: 0 18px 42px rgb(12 28 52 / 0.26);
@@ -2346,10 +2539,10 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 10px 12px;
+  gap: var(--space-sm);
+  padding: var(--space-xs) var(--space-sm);
   border-bottom: 1px solid rgb(255 255 255 / 0.1);
-  font-size: 14px;
+  font-size: var(--font-sm);
   font-weight: 800;
 }
 
@@ -2357,8 +2550,8 @@ onBeforeUnmount(() => {
   border-radius: 999px;
   background: rgb(255 255 255 / 0.08);
   color: #b8c7dc;
-  padding: 3px 8px;
-  font-size: 12px;
+  padding: var(--space-2xs) var(--space-xs);
+  font-size: var(--font-xs);
   font-weight: 800;
 }
 
@@ -2369,7 +2562,7 @@ onBeforeUnmount(() => {
 
 .debug-video-box {
   position: relative;
-  height: clamp(132px, 9.5vw, 176px);
+  height: clamp(86px, min(9.5vw, 15vh), 176px);
   overflow: hidden;
   background: #07111f;
 }
@@ -2386,7 +2579,7 @@ onBeforeUnmount(() => {
   height: 100%;
   place-items: center;
   color: #9fb0c8;
-  font-size: 13px;
+  font-size: var(--font-xs);
 }
 
 .debug-video-placeholder span {
@@ -2415,8 +2608,8 @@ onBeforeUnmount(() => {
 .finger-grid {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
-  gap: 6px;
-  padding: 10px 12px 0;
+  gap: var(--space-2xs);
+  padding: var(--space-xs) var(--space-sm) 0;
 }
 
 .finger-grid span {
@@ -2425,9 +2618,9 @@ onBeforeUnmount(() => {
   border-radius: 7px;
   background: rgb(255 255 255 / 0.06);
   color: #b6c3d6;
-  padding: 6px 2px;
+  padding: var(--space-2xs) 2px;
   text-align: center;
-  font-size: 12px;
+  font-size: var(--font-xs);
   font-weight: 800;
 }
 
@@ -2439,23 +2632,23 @@ onBeforeUnmount(() => {
 
 .hand-debug-panel p {
   margin: 0;
-  padding: 10px 12px 12px;
+  padding: var(--space-xs) var(--space-sm) var(--space-sm);
   color: #aebbd0;
-  font-size: 12px;
+  font-size: var(--font-xs);
   line-height: 1.45;
 }
 
 .assist-card {
   position: absolute;
-  right: 28px;
-  bottom: 28px;
+  right: var(--space-lg);
+  bottom: var(--space-lg);
   z-index: 5;
-  width: clamp(226px, 15.4vw, 292px);
-  padding: 22px 26px;
-  border-radius: 10px;
+  width: clamp(180px, min(15.4vw, 26vh), 292px);
+  padding: var(--space-md) var(--space-lg);
+  border-radius: var(--panel-radius);
   background: rgb(82 94 112 / 0.7);
   color: white;
-  font-size: clamp(15px, 1.08vw, 20px);
+  font-size: var(--font-md);
   font-weight: 600;
   box-shadow: 0 22px 48px rgb(43 65 94 / 0.2);
   backdrop-filter: blur(14px);
@@ -2464,35 +2657,35 @@ onBeforeUnmount(() => {
 .assist-card p {
   display: flex;
   align-items: center;
-  gap: 13px;
+  gap: var(--space-sm);
   margin: 0;
 }
 
 .assist-card p + p {
-  margin-top: 18px;
+  margin-top: var(--space-md);
 }
 
 .assist-card small {
   display: block;
-  margin-top: 18px;
+  margin-top: var(--space-md);
   color: rgb(255 255 255 / 0.7);
-  font-size: 13px;
+  font-size: var(--font-xs);
   font-weight: 500;
 }
 
 .quick-upload {
   position: absolute;
   left: 50%;
-  bottom: 22px;
+  bottom: var(--space-lg);
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-xs);
   transform: translateX(-50%);
   border: 0;
   border-radius: 8px;
   background: rgb(16 38 66 / 0.72);
   color: white;
-  padding: 10px 15px;
+  padding: var(--space-xs) var(--space-md);
   cursor: pointer;
   backdrop-filter: blur(12px);
 }
@@ -2504,10 +2697,10 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 12px;
+  gap: var(--space-sm);
   background: rgb(8 19 34 / 0.76);
   color: white;
-  font-size: 18px;
+  font-size: var(--font-md);
   backdrop-filter: blur(8px);
 }
 
@@ -2532,7 +2725,8 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   background: rgb(82 38 30 / 0.84);
   color: #ffd7c2;
-  padding: 12px 16px;
+  padding: var(--space-sm) var(--space-md);
+  font-size: var(--font-sm);
 }
 
 .slide-progress {
@@ -2551,18 +2745,20 @@ onBeforeUnmount(() => {
 }
 
 .bottom-bar {
-  gap: 24px;
+  gap: var(--space-md);
   border-top: 1px solid rgb(255 255 255 / 0.08);
-  padding: 0 28px;
+  padding: var(--space-xs) var(--space-lg);
+  min-width: 0;
 }
 
 .collapse-button {
   display: grid;
-  width: 64px;
-  height: 58px;
+  flex: 0 0 auto;
+  width: clamp(42px, min(3.4vw, 6vh), 64px);
+  height: clamp(42px, min(3.1vw, 5.4vh), 58px);
   place-items: center;
   border: 0;
-  border-radius: 18px;
+  border-radius: clamp(10px, min(1vw, 1.8vh), 18px);
   background: rgb(255 255 255 / 0.07);
   color: #dbe5f4;
   cursor: pointer;
@@ -2571,22 +2767,25 @@ onBeforeUnmount(() => {
 .tool-strip {
   display: flex;
   flex: 1;
+  min-width: 0;
   justify-content: center;
-  gap: clamp(14px, 2vw, 38px);
+  gap: clamp(6px, min(1.5vw, 2.6vh), 38px);
 }
 
 .tool-button {
   display: inline-flex;
-  min-width: 166px;
-  height: 64px;
+  flex: 1 1 clamp(86px, min(7.4vw, 13vh), 126px);
+  min-width: 0;
+  max-width: clamp(112px, min(9.4vw, 16vh), 176px);
+  height: clamp(42px, min(3.4vw, 6vh), 64px);
   align-items: center;
   justify-content: center;
-  gap: 13px;
+  gap: var(--space-xs);
   border: 1px solid rgb(255 255 255 / 0.11);
-  border-radius: 8px;
+  border-radius: var(--panel-radius);
   background: linear-gradient(180deg, rgb(255 255 255 / 0.1), rgb(255 255 255 / 0.045));
   color: #f3f7ff;
-  font-size: 20px;
+  font-size: var(--font-md);
   font-weight: 600;
   cursor: pointer;
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.05);
@@ -2641,19 +2840,19 @@ onBeforeUnmount(() => {
 .confirm-dialog {
   width: min(460px, calc(100vw - 32px));
   border: 1px solid rgb(255 255 255 / 0.14);
-  border-radius: 14px;
+  border-radius: clamp(8px, min(0.8vw, 1.4vh), 14px);
   background: linear-gradient(180deg, rgb(18 32 52 / 0.98), rgb(12 21 36 / 0.98));
   box-shadow: 0 28px 80px rgb(0 0 0 / 0.42);
-  padding: 28px;
+  padding: var(--space-lg);
 }
 
 .settings-dialog {
   width: min(620px, calc(100vw - 32px));
   border: 1px solid rgb(255 255 255 / 0.14);
-  border-radius: 14px;
+  border-radius: clamp(8px, min(0.8vw, 1.4vh), 14px);
   background: linear-gradient(180deg, rgb(18 32 52 / 0.98), rgb(12 21 36 / 0.98));
   box-shadow: 0 28px 80px rgb(0 0 0 / 0.42);
-  padding: 24px;
+  padding: var(--space-lg);
 }
 
 .settings-dialog header,
@@ -2666,22 +2865,22 @@ onBeforeUnmount(() => {
 
 .settings-dialog header {
   justify-content: space-between;
-  margin-bottom: 18px;
+  margin-bottom: var(--space-md);
 }
 
 .settings-dialog h2 {
   margin: 0;
   color: white;
-  font-size: 24px;
+  font-size: var(--font-lg);
 }
 
 .settings-dialog header button {
   display: grid;
-  width: 34px;
-  height: 34px;
+  width: clamp(28px, min(2vw, 3.6vh), 34px);
+  height: clamp(28px, min(2vw, 3.6vh), 34px);
   place-items: center;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--panel-radius);
   background: rgb(255 255 255 / 0.07);
   color: white;
   cursor: pointer;
@@ -2689,9 +2888,9 @@ onBeforeUnmount(() => {
 
 .setting-row,
 .toggle-row {
-  gap: 18px;
+  gap: var(--space-md);
   border-top: 1px solid rgb(255 255 255 / 0.08);
-  padding: 18px 0;
+  padding: var(--space-md) 0;
 }
 
 .setting-row > span,
@@ -2706,12 +2905,12 @@ onBeforeUnmount(() => {
   display: block;
   margin-top: 6px;
   color: #9eacc2;
-  font-size: 13px;
+  font-size: var(--font-xs);
   font-weight: 500;
 }
 
 .setting-row input[type='range'] {
-  width: 190px;
+  width: clamp(120px, 28vw, 190px);
   accent-color: #2d91ff;
 }
 
@@ -2729,18 +2928,18 @@ onBeforeUnmount(() => {
 
 .settings-dialog footer {
   justify-content: flex-end;
-  gap: 12px;
+  gap: var(--space-sm);
   border-top: 1px solid rgb(255 255 255 / 0.08);
-  padding-top: 18px;
+  padding-top: var(--space-md);
 }
 
 .settings-dialog footer button {
-  height: 40px;
+  height: clamp(34px, min(2.4vw, 4.4vh), 40px);
   border: 1px solid rgb(255 255 255 / 0.14);
-  border-radius: 8px;
+  border-radius: var(--panel-radius);
   background: rgb(255 255 255 / 0.08);
   color: white;
-  padding: 0 16px;
+  padding: 0 var(--space-md);
   cursor: pointer;
 }
 
@@ -2754,27 +2953,27 @@ onBeforeUnmount(() => {
 .confirm-dialog h2 {
   margin: 0;
   color: white;
-  font-size: 24px;
+  font-size: var(--font-lg);
 }
 
 .confirm-dialog p {
-  margin: 12px 0 0;
+  margin: var(--space-sm) 0 0;
   color: #becbe0;
   line-height: 1.75;
 }
 
 .confirm-checks {
   display: grid;
-  gap: 10px;
-  margin: 22px 0;
+  gap: var(--space-sm);
+  margin: var(--space-lg) 0;
 }
 
 .confirm-checks span {
   border: 1px solid rgb(255 255 255 / 0.1);
-  border-radius: 8px;
+  border-radius: var(--panel-radius);
   background: rgb(255 255 255 / 0.05);
   color: #c8d4e7;
-  padding: 10px 12px;
+  padding: var(--space-xs) var(--space-sm);
 }
 
 .confirm-checks span.ok {
@@ -2785,16 +2984,16 @@ onBeforeUnmount(() => {
 .confirm-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 12px;
+  gap: var(--space-sm);
 }
 
 .confirm-actions button {
-  height: 40px;
+  height: clamp(34px, min(2.4vw, 4.4vh), 40px);
   border: 1px solid rgb(255 255 255 / 0.14);
-  border-radius: 8px;
+  border-radius: var(--panel-radius);
   background: rgb(255 255 255 / 0.08);
   color: white;
-  padding: 0 16px;
+  padding: 0 var(--space-md);
   cursor: pointer;
 }
 
@@ -2806,40 +3005,46 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 1400px) {
+  .top-bar {
+    gap: var(--space-sm);
+  }
+
+  .brand-zone {
+    flex-basis: 220px;
+  }
+
   .device-zone {
-    min-width: 390px;
+    flex-basis: 260px;
   }
 
   .camera-toggle span,
   .settings-button span,
-  .upload-button span {
+  .upload-button span,
+  .live-state,
+  .window-actions {
     display: none;
   }
 
   .tool-button {
-    min-width: 132px;
-    font-size: 17px;
+    font-size: var(--font-sm);
   }
 
   .process-row {
-    gap: 18px;
+    gap: var(--space-md);
   }
 
   .step-arrow {
-    left: calc(50% + 72px);
-    width: 84px;
+    left: calc(50% + clamp(34px, min(4.2vw, 7vh), 72px));
+    width: clamp(34px, min(5vw, 8.4vh), 84px);
   }
 }
 
 @media (max-width: 980px) {
   .prototype-shell {
-    grid-template-rows: auto minmax(0, 1fr) auto;
-  }
-
-  .top-bar {
-    flex-wrap: wrap;
     height: auto;
-    padding: 12px;
+    min-height: 100dvh;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    overflow: visible;
   }
 
   .brand-zone,
@@ -2851,16 +3056,18 @@ onBeforeUnmount(() => {
   }
 
   .stage-area {
-    padding: 10px;
+    --stage-max-height: none;
+    padding: var(--space-sm);
   }
 
   .presentation-stage {
     width: 100%;
+    max-height: none;
   }
 
   .camera-preview {
-    width: 190px;
-    height: 96px;
+    width: clamp(150px, 27vw, 190px);
+    height: clamp(76px, 14vw, 96px);
   }
 
   .hand-debug-panel {
@@ -2870,7 +3077,7 @@ onBeforeUnmount(() => {
   }
 
   .debug-video-box {
-    height: 118px;
+    height: clamp(84px, 18vw, 118px);
   }
 
   .assist-card {
@@ -2880,11 +3087,11 @@ onBeforeUnmount(() => {
   .process-row {
     grid-template-columns: repeat(5, 1fr);
     width: 94%;
-    gap: 8px;
+    gap: var(--space-xs);
   }
 
   .process-step h3 {
-    font-size: 12px;
+    font-size: var(--font-xs);
   }
 
   .process-step p,
@@ -2893,7 +3100,7 @@ onBeforeUnmount(() => {
   }
 
   .bottom-bar {
-    padding: 12px;
+    padding: var(--space-sm);
   }
 
   .collapse-button {
@@ -2905,9 +3112,115 @@ onBeforeUnmount(() => {
   }
 
   .tool-button {
-    min-width: 120px;
-    height: 48px;
-    font-size: 15px;
+    flex-basis: calc(50% - 8px);
+    max-width: none;
+    height: clamp(40px, 8vw, 48px);
+    font-size: var(--font-sm);
+  }
+}
+
+@media (max-height: 760px) and (min-width: 981px) {
+  .prototype-shell {
+    --chrome-top: 54px;
+    --chrome-bottom: 70px;
+    grid-template-rows: var(--chrome-top) minmax(0, 1fr) var(--chrome-bottom);
+  }
+
+  .stage-area {
+    --stage-max-height: calc(100dvh - var(--chrome-top) - var(--chrome-bottom) - var(--stage-pad) * 2);
+    padding: var(--stage-pad);
+  }
+
+  .app-logo,
+  .divider,
+  .live-state,
+  .window-actions,
+  .camera-preview,
+  .assist-card {
+    display: none;
+  }
+
+  .top-bar {
+    padding-block: 0;
+  }
+
+  .bottom-bar {
+    padding-block: 6px;
+  }
+
+  .hand-debug-panel {
+    top: 12px;
+    right: 12px;
+    width: min(240px, 18vw);
+  }
+
+  .debug-video-box,
+  .finger-grid {
+    display: none;
+  }
+
+  .hand-debug-panel p {
+    padding-top: 8px;
+  }
+
+  .tool-button {
+    height: clamp(40px, 6.6vh, 50px);
+  }
+}
+
+@media (max-width: 720px) {
+  .prototype-shell {
+    min-height: 100dvh;
+  }
+
+  .top-bar {
+    padding: var(--space-sm);
+  }
+
+  .brand-zone h1 {
+    font-size: var(--font-md);
+  }
+
+  .file-title {
+    order: 3;
+  }
+
+  .stage-area {
+    align-items: start;
+  }
+
+  .camera-preview,
+  .hand-debug-panel {
+    display: none;
+  }
+
+  .slide-heading {
+    padding-top: clamp(24px, 8vw, 40px);
+  }
+
+  .process-row {
+    margin-top: clamp(18px, 7vw, 32px);
+  }
+
+  .step-icon {
+    width: clamp(48px, 15vw, 86px);
+    height: clamp(48px, 15vw, 86px);
+  }
+
+  .step-icon svg {
+    width: clamp(24px, 8vw, 36px);
+    height: clamp(24px, 8vw, 36px);
+  }
+
+  .tool-button {
+    flex-basis: calc(50% - 6px);
+    height: clamp(38px, 11vw, 44px);
+    font-size: var(--font-sm);
+  }
+
+  .tool-button svg {
+    width: clamp(18px, 5.6vw, 22px);
+    height: clamp(18px, 5.6vw, 22px);
   }
 }
 </style>
