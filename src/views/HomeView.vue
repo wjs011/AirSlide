@@ -9,8 +9,11 @@ import {
   ChevronUp,
   Eraser,
   Expand,
+  Clock,
+  FileText,
   FileUp,
   Hand,
+  Lightbulb,
   Loader2,
   Maximize2,
   Mic,
@@ -20,9 +23,13 @@ import {
   Pause,
   PenLine,
   Settings,
+  Sparkles,
+  SlidersHorizontal,
   Square,
+  UserRound,
   UploadCloud,
   Video,
+  Wrench,
   X,
 } from 'lucide-vue-next'
 
@@ -59,6 +66,20 @@ type OnboardingStep = {
   cue: string
   steps: string[]
   notes: string[]
+}
+
+type ImportGuideSlide = {
+  step: string
+  navLabel: string
+  title: string
+  summary: string
+  facts: Array<{
+    label: string
+    value: string
+    detail: string
+  }>
+  tip: string
+  icon: 'upload' | 'camera' | 'gesture' | 'tools'
 }
 
 type VisionResult = {
@@ -182,6 +203,7 @@ const debugVideoRef = ref<HTMLVideoElement | null>(null)
 const frameCanvasRef = ref<HTMLCanvasElement | null>(null)
 const cameraStream = ref<MediaStream | null>(null)
 const deck = ref<PresentationManifest | null>(null)
+const pendingDeck = ref<PresentationManifest | null>(null)
 const currentIndex = ref(0)
 const demoIndex = ref(7)
 const activeMode = ref<ToolMode>('pointer')
@@ -217,8 +239,10 @@ const externalControlEnabled = ref(false)
 const externalControlStatus = ref('外部控制待检测')
 const fullscreenPresentationActive = ref(false)
 const fullscreenChromeVisible = ref(true)
-const showOnboarding = ref(true)
+const showOnboarding = ref(false)
 const expandedOnboardingStep = ref<number | null>(null)
+const showImportGuide = ref(false)
+const importGuideIndex = ref(0)
 const visionSettings = ref<VisionSettings>({
   cooldownSeconds: 5,
   swipeThreshold: 0.02,
@@ -543,6 +567,26 @@ async function handleVoiceCandidates(candidates: VoiceTranscriptCandidate[]) {
 
 const currentSlide = computed(() => deck.value?.slides[currentIndex.value] ?? null)
 const hasDeck = computed(() => Boolean(deck.value?.slides.length))
+const activeImportGuideSlide = computed(() => importGuideSlides[importGuideIndex.value] ?? importGuideSlides[0])
+const isImportGuideLastStep = computed(() => importGuideIndex.value >= importGuideSlides.length - 1)
+const importGuideDeckReady = computed(() => Boolean(pendingDeck.value) && !isUploading.value)
+const canEnterImportedDeck = computed(() => isImportGuideLastStep.value && importGuideDeckReady.value)
+const importGuideProgressText = computed(() => `第 ${importGuideIndex.value + 1} 步 / ${importGuideSlides.length}`)
+const importGuideStatusText = computed(() => {
+  if (isUploading.value) return '正在转换 PPT 页面'
+  if (pendingDeck.value) return 'PPT 已转换完成'
+  return '等待导入 PPT'
+})
+const importGuidePrimaryText = computed(() => {
+  if (!isImportGuideLastStep.value) return '下一步'
+  if (canEnterImportedDeck.value) return '已阅读'
+  return '等待 PPT 转换完成'
+})
+const importGuideFooterText = computed(() => {
+  if (!isImportGuideLastStep.value) return '依次看完这几项准备内容，最后即可进入放映。'
+  if (canEnterImportedDeck.value) return '准备完成，可以进入放映界面。'
+  return '准备内容已看完，等待 PPT 转换完成后即可进入放映。'
+})
 const filename = computed(() => deck.value?.filename || '人工智能进展与未来趋势.pptx')
 const slideCount = computed(() => deck.value?.slideCount ?? 13)
 const displayIndex = computed(() => (hasDeck.value ? currentIndex.value + 1 : demoIndex.value + 1))
@@ -763,6 +807,109 @@ const onboardingSteps: OnboardingStep[] = [
   },
 ]
 
+const importGuideSlides: ImportGuideSlide[] = [
+  {
+    step: '第一步',
+    navLabel: '导入',
+    title: '先完成导入，再\n进入放映',
+    summary: '选择 PPT 后，系统会先完成页面转换。转换完成并阅读完这份说明后，才能进入放映界面。',
+    facts: [
+      {
+        label: '文件格式',
+        value: '.ppt / .pptx',
+        detail: '建议优先使用 16:9 页面比例，投影显示更稳定。',
+      },
+      {
+        label: '进入条件',
+        value: '转换完成 + 已阅读',
+        detail: '两项都满足后，最后一页按钮才可进入放映。',
+      },
+      {
+        label: '等待时间',
+        value: '与页数相关',
+        detail: '文件页数越多，转换时间会略长一些。',
+      },
+    ],
+    tip: '看到右上角“PPT 已转换完成”后，再点击最后一步的“已阅读”进入放映。',
+    icon: 'upload',
+  },
+  {
+    step: '第二步',
+    navLabel: '站位',
+    title: '站位稳定，\n识别会更准确',
+    summary: 'AirSlide 会通过摄像头识别人脸和手势。正式演示前，先确认人脸和手部都能稳定进入识别区域。',
+    facts: [
+      {
+        label: '推荐距离',
+        value: '2 到 3 米',
+        detail: '让人脸稳定出现在左上角预览区内。',
+      },
+      {
+        label: '手势位置',
+        value: '胸前到肩部',
+        detail: '手势动作尽量在身体前方完成，不要离镜头太边缘。',
+      },
+      {
+        label: '环境要求',
+        value: '光线均匀',
+        detail: '尽量避免逆光、反光和手部被身体或讲台遮挡。',
+      },
+    ],
+    tip: '开始演示前先看一眼左上角预览区，人脸框稳定后再开始做翻页手势。',
+    icon: 'camera',
+  },
+  {
+    step: '第三步',
+    navLabel: '控制',
+    title: '先摆出手势，再\n挥手翻页',
+    summary: '翻页手势有固定规则。请先摆出正确手型并保持 1 秒，系统激活后再向左或向右挥手翻页。',
+    facts: [
+      {
+        label: '激活手型',
+        value: '食指 + 中指伸出',
+        detail: '无名指和小指需要收起，系统才会进入翻页准备状态。',
+      },
+      {
+        label: '保持时间',
+        value: '1 秒',
+        detail: '手型保持约 1 秒后，系统才会接受挥手翻页。',
+      },
+      {
+        label: '翻页间隔',
+        value: '5 秒',
+        detail: '每次翻页后有 5 秒冷却时间，避免连续误触。',
+      },
+    ],
+    tip: '如果手势没有触发，先检查手型是否正确，再确认是否仍在 5 秒冷却时间内。',
+    icon: 'gesture',
+  },
+  {
+    step: '第四步',
+    navLabel: '工具',
+    title: '放映工具都在\n底部工具栏',
+    summary: '进入放映后，常用操作都集中在底部工具栏，包括指针、标注、修正、放大和全屏。',
+    facts: [
+      {
+        label: '标注修正',
+        value: '橡皮擦 / 一键清除',
+        detail: '写错时可以局部擦除，也可以直接清空全部标记。',
+      },
+      {
+        label: '全屏模式',
+        value: '工具栏自动隐藏',
+        detail: '进入全屏后，鼠标移动时会重新显示上下工具栏。',
+      },
+      {
+        label: '语音辅助',
+        value: '可与手势配合',
+        detail: '语音可用于翻页、切换工具和暂停识别等常用操作。',
+      },
+    ],
+    tip: '准备完成后，点击“已阅读”进入放映；如果按钮不可用，请先等待 PPT 转换完成。',
+    icon: 'tools',
+  },
+]
+
 function slideUrl(slide: Slide) {
   if (/^https?:\/\//.test(slide.url)) return slide.url
   return `${apiBase}${slide.url}`
@@ -770,6 +917,19 @@ function slideUrl(slide: Slide) {
 
 function pickFile() {
   fileInput.value?.click()
+}
+
+function resetImportGuideFlow() {
+  showImportGuide.value = false
+  importGuideIndex.value = 0
+  pendingDeck.value = null
+}
+
+function startImportGuideFlow() {
+  showOnboarding.value = false
+  showImportGuide.value = true
+  importGuideIndex.value = 0
+  pendingDeck.value = null
 }
 
 function dismissOnboarding() {
@@ -781,6 +941,36 @@ function startWithGuide() {
   showOnboarding.value = true
 }
 
+function previousImportGuideStep() {
+  importGuideIndex.value = Math.max(0, importGuideIndex.value - 1)
+}
+
+function activatePresentation(manifest: PresentationManifest) {
+  deck.value = manifest
+  currentIndex.value = 0
+  activeMode.value = 'pointer'
+  recognitionPaused.value = false
+  annotations.value = []
+  drawingLine.value = null
+  showAnnotationActions.value = false
+  showEndConfirm.value = false
+  pendingEndByVoice.value = false
+}
+
+function enterImportedPresentation() {
+  if (!canEnterImportedDeck.value || !pendingDeck.value) return
+  activatePresentation(pendingDeck.value)
+  resetImportGuideFlow()
+}
+
+function nextImportGuideStep() {
+  if (isImportGuideLastStep.value) {
+    enterImportedPresentation()
+    return
+  }
+  importGuideIndex.value = Math.min(importGuideSlides.length - 1, importGuideIndex.value + 1)
+}
+
 function validateFile(file: File) {
   if (!/\.(ppt|pptx)$/i.test(file.name)) {
     throw new Error('请上传 .ppt 或 .pptx 文件')
@@ -788,7 +978,13 @@ function validateFile(file: File) {
 }
 
 async function uploadFile(file: File) {
-  validateFile(file)
+  try {
+    validateFile(file)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : 'PPT 载入失败'
+    return
+  }
+  startImportGuideFlow()
   isUploading.value = true
   errorMessage.value = ''
 
@@ -812,10 +1008,9 @@ async function uploadFile(file: File) {
       throw new Error(message)
     }
 
-    deck.value = (await response.json()) as PresentationManifest
-    currentIndex.value = 0
-    showOnboarding.value = false
+    pendingDeck.value = (await response.json()) as PresentationManifest
   } catch (error) {
+    resetImportGuideFlow()
     errorMessage.value = error instanceof Error ? error.message : 'PPT 载入失败'
   } finally {
     isUploading.value = false
@@ -1638,7 +1833,11 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main ref="shellRef" class="prototype-shell" :class="{ 'presentation-mode': fullscreenPresentationActive, 'chrome-hidden': fullscreenPresentationActive && !fullscreenChromeVisible }">
+  <main
+    ref="shellRef"
+    class="prototype-shell"
+    :class="{ 'presentation-mode': fullscreenPresentationActive, 'chrome-hidden': fullscreenPresentationActive && !fullscreenChromeVisible, 'guide-mode': showImportGuide }"
+  >
     <input
       ref="fileInput"
       class="sr-only"
@@ -1709,7 +1908,96 @@ onBeforeUnmount(() => {
         @drop="onDrop"
         @pointermove="handleStagePointerMove"
       >
-        <template v-if="currentSlide">
+        <section v-if="showImportGuide" class="import-guide-overlay">
+          <div class="import-guide-backdrop" @click="resetImportGuideFlow"></div>
+          <article class="import-guide-card">
+            <header class="import-guide-topbar">
+              <button class="import-guide-back" type="button" @click="resetImportGuideFlow">
+                <ArrowLeft :size="20" />
+                <span>返回首页</span>
+              </button>
+              <span class="import-guide-status" :class="{ ready: importGuideDeckReady, busy: isUploading }">
+                <Loader2 v-if="isUploading" :size="20" class="spin" />
+                <CheckCircle2 v-else-if="importGuideDeckReady" :size="20" />
+                <span>{{ importGuideStatusText }}</span>
+              </span>
+            </header>
+
+            <div class="import-guide-hero">
+              <p>放映前准备</p>
+              <h2>{{ activeImportGuideSlide.title }}</h2>
+            </div>
+
+            <div class="import-guide-body">
+              <nav class="import-guide-tabs" aria-label="放映前准备步骤">
+                <template v-for="(guideStep, index) in importGuideSlides" :key="guideStep.step">
+                  <button
+                    type="button"
+                    class="import-guide-tab"
+                    :class="{ active: index === importGuideIndex, done: index < importGuideIndex }"
+                    @click="importGuideIndex = index"
+                  >
+                    <component
+                      :is="guideStep.icon === 'upload' ? FileText : guideStep.icon === 'camera' ? UserRound : guideStep.icon === 'gesture' ? SlidersHorizontal : Wrench"
+                      :size="24"
+                    />
+                    <span>{{ String(index + 1).padStart(2, '0') }}</span>
+                    <strong>{{ guideStep.navLabel }}</strong>
+                  </button>
+                  <div v-if="index < importGuideSlides.length - 1" class="import-guide-connector" aria-hidden="true">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                  </div>
+                </template>
+              </nav>
+
+              <section class="import-guide-panel">
+                <div class="import-guide-intro">
+                  <div class="import-guide-intro-icon">
+                    <Sparkles :size="26" />
+                  </div>
+                  <p class="import-guide-summary">{{ activeImportGuideSlide.summary }}</p>
+                </div>
+                <div class="import-guide-divider"></div>
+                <div class="import-guide-facts">
+                  <article v-for="(fact, factIndex) in activeImportGuideSlide.facts" :key="fact.label" class="import-guide-fact">
+                    <FileText v-if="factIndex === 0" :size="28" />
+                    <CheckCircle2 v-else-if="factIndex === 1" :size="28" />
+                    <Clock v-else :size="28" />
+                    <span>{{ fact.label }}</span>
+                    <strong>{{ fact.value }}</strong>
+                    <p>{{ fact.detail }}</p>
+                  </article>
+                </div>
+                <div class="import-guide-note">
+                  <div class="import-guide-note-icon">
+                    <Lightbulb :size="20" />
+                  </div>
+                  <div>
+                    <span>提示</span>
+                    <p>{{ activeImportGuideSlide.tip }}</p>
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <footer class="import-guide-footer">
+              <div class="import-guide-footer-copy">
+                <strong>{{ importGuideProgressText }}</strong>
+                <p>{{ importGuideFooterText }}</p>
+              </div>
+              <div class="import-guide-actions">
+                <button type="button" :disabled="importGuideIndex === 0" @click="previousImportGuideStep">上一步</button>
+                <button class="primary" type="button" :disabled="isImportGuideLastStep && !canEnterImportedDeck" @click="nextImportGuideStep">
+                  {{ importGuidePrimaryText }}
+                </button>
+              </div>
+            </footer>
+          </article>
+        </section>
+
+        <template v-else-if="currentSlide">
           <img class="real-slide" :src="slideUrl(currentSlide)" :alt="`PPT 第 ${currentSlide.index} 页`" />
         </template>
 
@@ -1772,12 +2060,12 @@ onBeforeUnmount(() => {
             <section class="launchpad-copy">
               <h2>先导入 PPT，再进入放映控制</h2>
               <p>
-                当前启动页只保留最终交付所需入口。导入成功后，系统会进入放映界面，并启用摄像头预览、手势翻页、语音辅助和标注工具。
+                导入演示文稿后，系统会完成页面转换，并进入支持手势、语音与标注控制的放映界面。
               </p>
               <div class="launchpad-highlights">
                 <span>支持 .ppt / .pptx</span>
                 <span>适配投影放映场景</span>
-                <span>导入后进入完整控制台</span>
+                <span>导入后进入放映模式</span>
               </div>
             </section>
 
@@ -2382,11 +2670,30 @@ onBeforeUnmount(() => {
   grid-template-rows: minmax(0, 1fr);
 }
 
+.prototype-shell.guide-mode {
+  grid-template-rows: minmax(0, 1fr);
+}
+
 .prototype-shell.presentation-mode .top-bar,
 .prototype-shell.presentation-mode .bottom-bar {
   position: absolute;
   left: 0;
   right: 0;
+}
+
+.prototype-shell.guide-mode .top-bar,
+.prototype-shell.guide-mode .bottom-bar {
+  display: none;
+}
+
+.prototype-shell.guide-mode .stage-area {
+  --stage-max-height: calc(100dvh - var(--chrome-top) - var(--chrome-bottom) - var(--stage-pad) * 2);
+  padding: var(--stage-pad);
+}
+
+.prototype-shell.guide-mode .presentation-stage {
+  width: min(100%, 1880px, calc(var(--stage-max-height) * 16 / 9));
+  max-width: 1880px;
 }
 
 .prototype-shell.presentation-mode .top-bar {
@@ -3231,6 +3538,403 @@ onBeforeUnmount(() => {
   backdrop-filter: blur(8px);
 }
 
+.import-guide-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 12;
+  display: block;
+  padding: 0;
+  overflow: hidden;
+}
+
+.import-guide-backdrop {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle at 27% 27%, rgb(30 107 238 / 0.28), transparent 30%),
+    radial-gradient(circle at 78% 34%, rgb(10 164 143 / 0.28), transparent 28%),
+    linear-gradient(135deg, #071121 0%, #0b1830 48%, #071c24 100%);
+  z-index: 0;
+}
+
+.import-guide-card {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: clamp(12px, 2vh, 24px);
+  width: 100%;
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+  background:
+    radial-gradient(circle at 18% 24%, rgb(26 83 177 / 0.22), transparent 28%),
+    radial-gradient(circle at 82% 35%, rgb(9 151 133 / 0.2), transparent 30%),
+    linear-gradient(135deg, rgb(6 14 27 / 0.92), rgb(8 22 42 / 0.92) 48%, rgb(5 28 34 / 0.92));
+  padding: clamp(18px, 2.65vh, 32px) clamp(34px, 3.8vw, 64px) clamp(18px, 2.75vh, 34px);
+  box-shadow: inset 0 0 0 1px rgb(214 226 255 / 0.72);
+}
+
+.import-guide-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.import-guide-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  background: transparent;
+  color: #d8e5f6;
+  padding: 0;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transform: translateX(-18px);
+}
+
+.import-guide-back svg,
+.import-guide-status svg {
+  width: 18px;
+  height: 18px;
+}
+
+.import-guide-hero {
+  display: grid;
+  gap: 7px;
+  width: min(1180px, 100%);
+  max-width: 470px;
+  margin: 0 auto;
+  margin-left: calc((100% - min(1180px, 100%)) / 2);
+}
+
+.import-guide-hero p {
+  margin: 0;
+  color: #8fb4ff;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.import-guide-hero h2 {
+  margin: 0;
+  color: white;
+  white-space: pre-line;
+  max-width: 12ch;
+  font-size: clamp(28px, 3.55vh, 42px);
+  line-height: 1.24;
+  letter-spacing: 0;
+  font-weight: 800;
+}
+
+.import-guide-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 28px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #e8f1ff;
+  padding: 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.import-guide-status.ready {
+  color: #e8f1ff;
+}
+
+.import-guide-status.busy {
+  color: #e8f1ff;
+}
+
+.import-guide-body {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(14px, 2.1vh, 26px);
+  min-height: auto;
+  width: min(1180px, 100%);
+  margin: 0 auto;
+  padding-top: 0;
+}
+
+.import-guide-tabs {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) 24px minmax(160px, 1fr) 24px minmax(160px, 1fr) 24px minmax(160px, 1fr);
+  gap: 10px;
+  align-items: center;
+}
+
+.import-guide-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: clamp(44px, 5.7vh, 56px);
+  border: 1px solid rgb(120 155 205 / 0.28);
+  border-radius: 20px;
+  background: rgb(9 21 38 / 0.46);
+  color: #c5d3e3;
+  padding: 0 16px;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 160ms ease,
+    background 160ms ease,
+    color 160ms ease;
+}
+
+.import-guide-tab:hover {
+  border-color: rgb(73 138 255 / 0.52);
+  background: rgb(22 49 89 / 0.52);
+}
+
+.import-guide-tab.active {
+  border-color: rgb(70 139 255 / 0.84);
+  background: linear-gradient(135deg, #1f5cc0, #3479e6);
+  color: white;
+  box-shadow:
+    0 14px 26px rgb(20 86 202 / 0.28),
+    inset 0 1px 0 rgb(255 255 255 / 0.12);
+}
+
+.import-guide-tab.done {
+  border-color: rgb(120 155 205 / 0.28);
+}
+
+.import-guide-tab span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  background: transparent;
+  color: currentColor;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.import-guide-tab strong {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.import-guide-tab svg {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+}
+
+.import-guide-connector {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  opacity: 0.8;
+}
+
+.import-guide-connector span {
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: #357cff;
+}
+
+.import-guide-panel {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(11px, 1.65vh, 18px);
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+
+.import-guide-intro {
+  display: grid;
+  grid-template-columns: clamp(40px, 5.4vh, 52px) minmax(0, 1fr);
+  align-items: center;
+  gap: 16px;
+}
+
+.import-guide-intro-icon {
+  display: grid;
+  width: clamp(40px, 5.4vh, 52px);
+  height: clamp(40px, 5.4vh, 52px);
+  place-items: center;
+  border: 1px solid rgb(69 129 236 / 0.42);
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgb(20 48 91 / 0.75), rgb(14 31 58 / 0.7));
+  color: #eef5ff;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.05);
+}
+
+.import-guide-intro-icon svg {
+  width: 22px;
+  height: 22px;
+}
+
+.import-guide-summary {
+  margin: 0;
+  color: #cfe3ff;
+  max-width: 64ch;
+  font-size: clamp(13px, 1.45vh, 15px);
+  font-weight: 600;
+  line-height: 1.6;
+}
+
+.import-guide-divider {
+  height: 1px;
+  background: linear-gradient(90deg, rgb(76 118 178 / 0.58), rgb(78 128 194 / 0.22));
+}
+
+.import-guide-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.import-guide-fact {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 12px;
+  min-height: clamp(88px, 11.8vh, 114px);
+  align-content: start;
+  border: 1px solid rgb(62 117 194 / 0.34);
+  border-radius: 10px;
+  background: linear-gradient(160deg, rgb(12 35 72 / 0.58), rgb(13 26 48 / 0.66));
+  padding: clamp(12px, 1.8vh, 16px) clamp(14px, 1.9vw, 20px);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.04),
+    0 14px 28px rgb(0 0 0 / 0.14);
+}
+
+.import-guide-fact svg {
+  grid-row: 1 / span 2;
+  color: #8db9ff;
+  width: 23px;
+  height: 23px;
+}
+
+.import-guide-fact span {
+  color: #a7c3ff;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.import-guide-fact strong {
+  color: white;
+  font-size: clamp(17px, 2vh, 19px);
+  font-weight: 800;
+  line-height: 1.25;
+}
+
+.import-guide-fact p {
+  grid-column: 2;
+  margin: 0;
+  color: #b8c8dc;
+  line-height: 1.56;
+  font-size: 13px;
+}
+
+.import-guide-note {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid rgb(60 123 212 / 0.36);
+  border-radius: 10px;
+  background: linear-gradient(160deg, rgb(20 57 111 / 0.6), rgb(12 35 72 / 0.5));
+  padding: clamp(12px, 1.75vh, 16px) clamp(15px, 2vw, 20px);
+}
+
+.import-guide-note-icon {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: rgb(60 126 236 / 0.18);
+  color: #9ec7ff;
+}
+
+.import-guide-note span {
+  color: #a7c3ff;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.import-guide-note p {
+  margin: 0;
+  color: #d7e4f5;
+  line-height: 1.55;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.import-guide-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 0;
+  width: min(1180px, 100%);
+  margin-left: auto;
+  margin-right: auto;
+  padding-top: clamp(10px, 1.55vh, 18px);
+  border-top: 1px solid rgb(65 101 151 / 0.28);
+}
+
+.import-guide-footer-copy {
+  display: grid;
+  gap: 6px;
+}
+
+.import-guide-footer-copy strong {
+  color: white;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.import-guide-footer-copy p {
+  margin: 0;
+  color: #9bacbf;
+  line-height: 1.5;
+  font-size: 13px;
+}
+
+.import-guide-actions {
+  display: inline-flex;
+  gap: 12px;
+  flex: 0 0 auto;
+}
+
+.import-guide-actions button {
+  height: 44px;
+  min-width: 108px;
+  border: 1px solid rgb(79 113 160 / 0.22);
+  border-radius: 11px;
+  background: rgb(12 26 45 / 0.58);
+  color: #f2f6fb;
+  padding: 0 20px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.import-guide-actions button.primary {
+  border-color: rgb(66 139 255 / 0.8);
+  background: linear-gradient(135deg, #2467d2, #3c83f0);
+  color: white;
+  box-shadow: 0 12px 24px rgb(38 110 226 / 0.22);
+}
+
+.import-guide-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
 .spin {
   animation: spin 900ms linear infinite;
 }
@@ -3954,6 +4658,63 @@ onBeforeUnmount(() => {
     padding: 18px 16px;
   }
 
+  .import-guide-card {
+    padding: 18px;
+    gap: 14px;
+  }
+
+  .import-guide-hero h2 {
+    max-width: 12ch;
+    font-size: clamp(28px, 8vw, 36px);
+  }
+
+  .import-guide-topbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .import-guide-tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .import-guide-connector {
+    display: none;
+  }
+
+  .import-guide-tab {
+    min-height: 48px;
+    padding: 0 12px;
+  }
+
+  .import-guide-facts {
+    grid-template-columns: 1fr;
+  }
+
+  .import-guide-intro {
+    grid-template-columns: 44px minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .import-guide-intro-icon {
+    width: 44px;
+    height: 44px;
+  }
+
+  .import-guide-actions {
+    width: 100%;
+  }
+
+  .import-guide-actions button {
+    flex: 1 1 0;
+    justify-content: center;
+  }
+
+  .import-guide-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
   .onboarding-dialog {
     padding: 18px;
   }
@@ -4018,6 +4779,55 @@ onBeforeUnmount(() => {
   .tool-button svg {
     width: clamp(18px, 5.6vw, 22px);
     height: clamp(18px, 5.6vw, 22px);
+  }
+}
+
+@media (max-height: 920px) and (min-width: 961px) {
+  .import-guide-card {
+    gap: 14px;
+    padding: 26px 52px 26px;
+  }
+
+  .import-guide-hero h2 {
+    font-size: 38px;
+  }
+
+  .import-guide-tabs {
+    gap: 10px;
+    grid-template-columns: minmax(146px, 1fr) 22px minmax(146px, 1fr) 22px minmax(146px, 1fr) 22px minmax(146px, 1fr);
+  }
+
+  .import-guide-tab {
+    min-height: 50px;
+    border-radius: 19px;
+    padding-inline: 14px;
+  }
+
+  .import-guide-panel {
+    gap: 13px;
+  }
+
+  .import-guide-summary {
+    font-size: 14px;
+  }
+
+  .import-guide-fact {
+    min-height: 96px;
+    padding: 13px 16px;
+  }
+
+  .import-guide-fact strong {
+    font-size: 18px;
+  }
+
+  .import-guide-note p,
+  .import-guide-footer-copy p {
+    font-size: 13px;
+  }
+
+  .import-guide-actions button {
+    height: 44px;
+    min-width: 108px;
   }
 }
 </style>
