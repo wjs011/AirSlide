@@ -2,6 +2,9 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-socketio==5.11.4
 python-multipart==0.0.12
+eval_type_backport==0.2.2; python_version < "3.9"
 pywin32==306; platform_system == "Windows"
 opencv-python==4.11.0.86
-mediapipe==0.8.11
+mediapipe==0.10.5; python_version < "3.13"
+mediapipe==0.10.35; python_version >= "3.13"
+vosk==0.3.44

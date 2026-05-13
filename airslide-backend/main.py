@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import platform
 import re
 import shutil
+import subprocess
+import wave
 import textwrap
 import time
 import uuid
@@ -78,12 +81,76 @@ class VoiceRecognitionPayload(BaseModel):
     showEndConfirm: bool = False
 
 
+class VoiceAudioPayload(BaseModel):
+    data: str
+    showEndConfirm: bool = False
+
+
 class VoiceCommandPattern(BaseModel):
     action: str
     label: str
     phrases: List[str]
     weakPhrases: List[str] = []
     patterns: List[str] = []
+
+
+class VoiceTranscriber:
+    def __init__(self) -> None:
+        self.model_dir = BASE_DIR / "models" / "vosk-model-small-cn-0.22"
+        self._model: Any = None
+        self._error: Optional[str] = None
+
+    def _load_model(self) -> Any:
+        if self._model is not None:
+            return self._model
+        if not self.model_dir.exists():
+            raise RuntimeError(f"Vosk model not found: {self.model_dir}")
+        try:
+            from vosk import Model
+
+            self._model = Model(str(self.model_dir))
+            self._error = None
+            return self._model
+        except Exception as exc:
+            self._error = str(exc)
+            raise
+
+    def transcribe_wav(self, audio: bytes) -> Dict[str, Any]:
+        model = self._load_model()
+        try:
+            from vosk import KaldiRecognizer
+
+            with wave.open(io.BytesIO(audio), "rb") as wav:
+                channels = wav.getnchannels()
+                sample_width = wav.getsampwidth()
+                sample_rate = wav.getframerate()
+                if channels != 1 or sample_width != 2:
+                    raise ValueError("请上传 16-bit 单声道 WAV 音频")
+
+                recognizer = KaldiRecognizer(model, sample_rate)
+                recognizer.SetWords(False)
+                while True:
+                    chunk = wav.readframes(4000)
+                    if not chunk:
+                        break
+                    recognizer.AcceptWaveform(chunk)
+
+            result = json.loads(recognizer.FinalResult())
+            text = str(result.get("text", "")).replace(" ", "").strip()
+            return {
+                "text": text,
+                "sampleRate": sample_rate,
+                "error": None,
+                "model": self.model_dir.name,
+            }
+        except Exception as exc:
+            self._error = str(exc)
+            return {
+                "text": "",
+                "sampleRate": None,
+                "error": str(exc),
+                "model": self.model_dir.name,
+            }
 
 
 class VisionManager:
@@ -95,12 +162,26 @@ class VisionManager:
         self._previous_frames: Dict[str, Any] = {}
         self._last_action_at: Dict[str, float] = defaultdict(float)
         self._activation_started_at: Dict[str, float] = defaultdict(float)
+        self._last_pose_matched_at: Dict[str, float] = defaultdict(float)
         self._page_turn_armed: Dict[str, bool] = defaultdict(bool)
+        self._page_turn_armed_at: Dict[str, float] = defaultdict(float)
         self._opencv_error: Optional[str] = None
         self._mediapipe_error: Optional[str] = None
         self.cooldown_seconds = PAGE_TURN_COOLDOWN_SECONDS
-        self.swipe_threshold = 0.14
+        self.swipe_threshold = 0.02
         self.confidence_threshold = 0.45
+        self._minimum_swipe_duration = 0.22
+        self._maximum_swipe_duration = 0.9
+        self._maximum_vertical_drift = 0.08
+        self._minimum_swipe_velocity = 0.06
+        self._minimum_step_delta = 0.004
+        self._minimum_start_step_delta = 0.006
+        self._minimum_peak_step_delta = 0.008
+        self._minimum_directional_steps = 2
+        self._minimum_swipe_directness = 0.72
+        self._page_turn_settle_seconds = 0.18
+        self._page_turn_hold_grace_seconds = 0.45
+        self._page_turn_arm_timeout = 2.2
 
         try:
             import cv2
@@ -360,14 +441,24 @@ class VisionManager:
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         now = time.perf_counter()
         pose_matched = landmark_hand is not None and landmark_hand["pose"] == "page_turn_ready"
+        if pose_matched:
+            self._last_pose_matched_at[client_id] = now
+        recently_pose_matched = (
+            self._last_pose_matched_at[client_id] > 0.0
+            and now - self._last_pose_matched_at[client_id] <= self._page_turn_hold_grace_seconds
+        )
+        hold_pose_active = pose_matched or recently_pose_matched
         cooldown_remaining = max(0.0, self.cooldown_seconds - (now - self._last_action_at[client_id]))
 
-        if pose_matched:
+        if hold_pose_active:
             if self._activation_started_at[client_id] == 0.0:
                 self._activation_started_at[client_id] = now
             hold_elapsed = now - self._activation_started_at[client_id]
             if hold_elapsed >= PAGE_TURN_HOLD_SECONDS and cooldown_remaining <= 0:
-                self._page_turn_armed[client_id] = True
+                if not self._page_turn_armed[client_id]:
+                    self._page_turn_armed[client_id] = True
+                    self._page_turn_armed_at[client_id] = now
+                    self._histories[client_id].clear()
         else:
             self._activation_started_at[client_id] = 0.0
 
@@ -378,57 +469,171 @@ class VisionManager:
         if hand is None:
             self._histories[client_id].clear()
             self._page_turn_armed[client_id] = False
+            self._page_turn_armed_at[client_id] = 0.0
+            self._activation_started_at[client_id] = 0.0
+            self._last_pose_matched_at[client_id] = 0.0
             return None, {
                 "pageTurnPoseMatched": False,
+                "pageTurnHoldGrace": False,
                 "pageTurnHoldProgress": 0.0,
                 "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
                 "pageTurnArmed": False,
+                "pageTurnSwipeDirection": None,
+                "pageTurnSwipeDelta": None,
+                "pageTurnSwipeVelocity": None,
                 "pageTurnCooldownRemaining": round(cooldown_remaining, 2),
             }
+
+        if (
+            self._page_turn_armed[client_id]
+            and self._page_turn_armed_at[client_id] > 0.0
+            and now - self._page_turn_armed_at[client_id] > self._page_turn_arm_timeout
+        ):
+            self._page_turn_armed[client_id] = False
+            self._page_turn_armed_at[client_id] = 0.0
+            self._activation_started_at[client_id] = 0.0
+            self._last_pose_matched_at[client_id] = 0.0
+            self._histories[client_id].clear()
 
         if not self._page_turn_armed[client_id]:
             self._histories[client_id].clear()
             return {
-                "name": "page-turn-hold" if pose_matched else hand["pose"],
+                "name": "page-turn-hold" if hold_pose_active else hand["pose"],
                 "action": "pointer" if hand["pose"] in {"pointing", "motion", "landmark_hand"} else "open_hand",
                 "confidence": hand["confidence"],
             }, {
-                "pageTurnPoseMatched": pose_matched,
+                "pageTurnPoseMatched": hold_pose_active,
+                "pageTurnHoldGrace": recently_pose_matched and not pose_matched,
                 "pageTurnHoldProgress": round(hold_progress, 2),
                 "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
                 "pageTurnArmed": False,
+                "pageTurnSwipeDirection": None,
+                "pageTurnSwipeDelta": None,
+                "pageTurnSwipeVelocity": None,
                 "pageTurnCooldownRemaining": round(cooldown_remaining, 2),
             }
 
-        tracking_hand = motion_hand or landmark_hand or hand
-        center = tracking_hand["center"]
-        history = self._histories[client_id]
-        history.append((now, center["x"], center["y"]))
+        tracking_hand = landmark_hand
+        if tracking_hand is None:
+            self._histories[client_id].clear()
+            self._page_turn_armed[client_id] = False
+            self._page_turn_armed_at[client_id] = 0.0
+            return None, {
+                "pageTurnPoseMatched": False,
+                "pageTurnHoldGrace": False,
+                "pageTurnHoldProgress": 0.0,
+                "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
+                "pageTurnArmed": False,
+                "pageTurnSwipeDirection": None,
+                "pageTurnSwipeDelta": None,
+                "pageTurnSwipeVelocity": None,
+                "pageTurnCooldownRemaining": round(cooldown_remaining, 2),
+            }
 
         action: Optional[str] = None
+        swipe_direction: Optional[str] = None
+        swipe_delta: Optional[float] = None
+        swipe_velocity: Optional[float] = None
+
+        armed_elapsed = now - self._page_turn_armed_at[client_id] if self._page_turn_armed_at[client_id] else 0.0
+        if armed_elapsed < self._page_turn_settle_seconds:
+            self._histories[client_id].clear()
+        else:
+            center = tracking_hand["center"]
+            history = self._histories[client_id]
+            history.append((now, center["x"], center["y"]))
+
+        history = self._histories[client_id]
         if len(history) >= 4 and cooldown_remaining <= 0:
-            first_time, first_x, first_y = history[0]
-            last_time, last_x, last_y = history[-1]
+            full_history = list(history)
+            full_step_deltas = [
+                full_history[index][1] - full_history[index - 1][1]
+                for index in range(1, len(full_history))
+            ]
+            start_index = next(
+                (
+                    index - 1
+                    for index, delta in enumerate(full_step_deltas, start=1)
+                    if abs(delta) >= self._minimum_start_step_delta
+                ),
+                None,
+            )
+            candidate = full_history[start_index:] if start_index is not None else []
+            if len(candidate) < 4:
+                first_time, first_x, first_y = full_history[0]
+                last_time, last_x, last_y = full_history[-1]
+                swipe_delta = round(last_x - first_x, 4)
+                swipe_velocity = round(abs(last_x - first_x) / max(last_time - first_time, 0.001), 3)
+                return {
+                    "name": "page-turn-armed",
+                    "action": "open_hand",
+                    "confidence": tracking_hand["confidence"],
+                }, {
+                    "pageTurnPoseMatched": hold_pose_active,
+                    "pageTurnHoldGrace": recently_pose_matched and not pose_matched,
+                    "pageTurnHoldProgress": round(hold_progress, 2),
+                    "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
+                    "pageTurnArmed": self._page_turn_armed[client_id],
+                    "pageTurnSwipeDirection": None,
+                    "pageTurnSwipeDelta": swipe_delta,
+                    "pageTurnSwipeVelocity": swipe_velocity,
+                    "pageTurnCooldownRemaining": round(cooldown_remaining, 2),
+                }
+
+            first_time, first_x, first_y = candidate[0]
+            last_time, last_x, last_y = candidate[-1]
             dx = last_x - first_x
             dy = abs(last_y - first_y)
             duration = max(last_time - first_time, 0.001)
+            step_deltas = [
+                candidate[index][1] - candidate[index - 1][1]
+                for index in range(1, len(candidate))
+            ]
+            horizontal_path = sum(abs(delta) for delta in step_deltas)
+            directness = abs(dx) / max(horizontal_path, 0.001)
+            direction_sign = 1 if dx > 0 else -1
+            directional_steps = sum(
+                1
+                for delta in step_deltas
+                if delta * direction_sign >= self._minimum_step_delta
+            )
+            signed_steps = [delta * direction_sign for delta in step_deltas]
+            start_step = signed_steps[0] if signed_steps else 0.0
+            peak_step = max(signed_steps) if signed_steps else 0.0
+            swipe_delta = round(dx, 4)
+            swipe_velocity = round(abs(dx) / duration, 3)
 
-            if 0.12 <= duration <= 2.4 and abs(dx) > self.swipe_threshold and dy < 0.32:
-                action = "next"
+            if (
+                self._minimum_swipe_duration <= duration <= self._maximum_swipe_duration
+                and abs(dx) > self.swipe_threshold
+                and dy < self._maximum_vertical_drift
+                and abs(dx) / duration >= self._minimum_swipe_velocity
+                and start_step >= self._minimum_start_step_delta
+                and peak_step >= self._minimum_peak_step_delta
+                and directness >= self._minimum_swipe_directness
+                and directional_steps >= self._minimum_directional_steps
+            ):
+                swipe_direction = "right" if dx > 0 else "left"
+                action = "next" if dx > 0 else "previous"
                 self._last_action_at[client_id] = now
                 self._page_turn_armed[client_id] = False
+                self._page_turn_armed_at[client_id] = 0.0
                 self._activation_started_at[client_id] = 0.0
                 history.clear()
 
         return {
-            "name": "page-turn-next" if action == "next" else "page-turn-armed",
+            "name": f"page-turn-{action}" if action else "page-turn-armed",
             "action": action or "open_hand",
             "confidence": tracking_hand["confidence"],
         }, {
-            "pageTurnPoseMatched": pose_matched,
+            "pageTurnPoseMatched": hold_pose_active,
+            "pageTurnHoldGrace": recently_pose_matched and not pose_matched,
             "pageTurnHoldProgress": round(hold_progress, 2),
             "pageTurnHoldSeconds": PAGE_TURN_HOLD_SECONDS,
             "pageTurnArmed": self._page_turn_armed[client_id],
+            "pageTurnSwipeDirection": swipe_direction,
+            "pageTurnSwipeDelta": swipe_delta,
+            "pageTurnSwipeVelocity": swipe_velocity,
             "pageTurnCooldownRemaining": round(
                 max(0.0, self.cooldown_seconds - (time.perf_counter() - self._last_action_at[client_id])),
                 2,
@@ -476,7 +681,7 @@ class VisionManager:
         if settings.cooldownSeconds is not None:
             self.cooldown_seconds = PAGE_TURN_COOLDOWN_SECONDS
         if settings.swipeThreshold is not None:
-            self.swipe_threshold = min(0.5, max(0.08, settings.swipeThreshold))
+            self.swipe_threshold = min(0.08, max(0.005, settings.swipeThreshold))
         if settings.confidenceThreshold is not None:
             self.confidence_threshold = min(0.95, max(0.2, settings.confidenceThreshold))
         return self.settings()
@@ -501,11 +706,16 @@ app.mount("/media", StaticFiles(directory=STORAGE_DIR), name="media")
 
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 vision_manager = VisionManager()
+voice_transcriber = VoiceTranscriber()
 
 
 class PresentationController:
     def __init__(self) -> None:
         self._powerpoint = None
+
+    @property
+    def supported_actions(self) -> set[str]:
+        return {"next", "previous", "first", "last", "start", "fullscreen", "end", "pause", "resume"}
 
     def _connect_powerpoint(self) -> bool:
         if platform.system() != "Windows":
@@ -521,9 +731,7 @@ class PresentationController:
             self._powerpoint = None
             return False
 
-    def _send_key(self, key: str) -> bool:
-        if platform.system() != "Windows":
-            return False
+    def _send_windows_key(self, key: str) -> bool:
         try:
             import win32com.client
 
@@ -533,12 +741,88 @@ class PresentationController:
         except Exception:
             return False
 
+    def _send_macos_key(self, action: str) -> Tuple[bool, str, Optional[str]]:
+        key_scripts = {
+            "next": "key code 124",
+            "previous": "key code 123",
+            "first": "key code 115",
+            "last": "key code 119",
+            "start": "key code 96",
+            "fullscreen": "key code 96",
+            "end": "key code 53",
+            "pause": 'keystroke "b"',
+            "resume": 'keystroke "b"',
+        }
+        script = key_scripts.get(action)
+        if script is None:
+            return False, "keyboard-macos", "Unsupported macOS action"
+        try:
+            subprocess.run(
+                ["osascript", "-e", f'tell application "System Events" to {script}'],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            return True, "keyboard-macos", None
+        except Exception:
+            return (
+                False,
+                "keyboard-macos",
+                "macOS 需要给终端或 Python 授予辅助功能权限，并让 PowerPoint 放映窗口保持前台",
+            )
+
+    def _send_linux_key(self, action: str) -> Tuple[bool, str, Optional[str]]:
+        xdotool = shutil.which("xdotool")
+        if xdotool is None:
+            return False, "keyboard-linux", "Linux 外部控制需要安装 xdotool"
+
+        key_map = {
+            "next": "Right",
+            "previous": "Left",
+            "first": "Home",
+            "last": "End",
+            "start": "F5",
+            "fullscreen": "F5",
+            "end": "Escape",
+            "pause": "b",
+            "resume": "b",
+        }
+        key = key_map.get(action)
+        if key is None:
+            return False, "keyboard-linux", "Unsupported Linux action"
+        try:
+            subprocess.run([xdotool, "key", key], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+            return True, "keyboard-linux", None
+        except Exception:
+            return False, "keyboard-linux", "xdotool 发送按键失败，请确认放映窗口在前台"
+
+    def _send_key(self, action: str) -> Tuple[bool, str, Optional[str]]:
+        system = platform.system()
+        if system == "Windows":
+            key_map = {
+                "next": "{RIGHT}",
+                "previous": "{LEFT}",
+                "first": "{HOME}",
+                "last": "{END}",
+                "start": "{F5}",
+                "fullscreen": "{F5}",
+                "end": "{ESC}",
+                "pause": "b",
+                "resume": "b",
+            }
+            return self._send_windows_key(key_map[action]), "keyboard-windows", None
+        if system == "Darwin":
+            return self._send_macos_key(action)
+        if system == "Linux":
+            return self._send_linux_key(action)
+        return False, f"keyboard-unsupported-{system.lower() or 'unknown'}", "当前系统不支持外部 PowerPoint 控制"
+
     def execute(self, action: str) -> Dict[str, Any]:
         action = action.lower().strip()
-        if action not in {"next", "previous", "start", "end", "pause"}:
+        if action not in self.supported_actions:
             raise ValueError("Unsupported presentation action")
 
-        method = "keyboard"
         powerpoint_ok = self._connect_powerpoint()
         if powerpoint_ok and self._powerpoint is not None:
             try:
@@ -546,25 +830,39 @@ class PresentationController:
                     self._powerpoint.ActivePresentation.SlideShowWindow.View.Next()
                 elif action == "previous":
                     self._powerpoint.ActivePresentation.SlideShowWindow.View.Previous()
-                elif action == "start":
+                elif action == "first":
+                    self._powerpoint.ActivePresentation.SlideShowWindow.View.First()
+                elif action == "last":
+                    self._powerpoint.ActivePresentation.SlideShowWindow.View.Last()
+                elif action in {"start", "fullscreen"}:
                     self._powerpoint.ActivePresentation.SlideShowSettings.Run()
                 elif action == "end":
                     self._powerpoint.ActivePresentation.SlideShowWindow.View.Exit()
-                elif action == "pause":
-                    self._send_key(" ")
-                return {"action": action, "executed": True, "method": "powerpoint-com"}
-            except Exception:
-                method = "keyboard-fallback"
+                elif action in {"pause", "resume"}:
+                    executed, method, detail = self._send_key(action)
+                    return {"action": action, "executed": executed, "method": method, "detail": detail, "platform": platform.system()}
+                return {"action": action, "executed": True, "method": "powerpoint-com", "platform": platform.system()}
+            except Exception as exc:
+                executed, method, detail = self._send_key(action)
+                return {
+                    "action": action,
+                    "executed": executed,
+                    "method": "keyboard-fallback" if executed else method,
+                    "detail": detail or str(exc),
+                    "platform": platform.system(),
+                }
 
-        key_map = {
-            "next": "{RIGHT}",
-            "previous": "{LEFT}",
-            "start": "{F5}",
-            "end": "{ESC}",
-            "pause": " ",
+        executed, method, detail = self._send_key(action)
+        return {"action": action, "executed": executed, "method": method, "detail": detail, "platform": platform.system()}
+
+    def status(self) -> Dict[str, Any]:
+        system = platform.system()
+        return {
+            "platform": system,
+            "supportedActions": sorted(self.supported_actions),
+            "powerpointComAvailable": system == "Windows",
+            "keyboardFallbackAvailable": system in {"Windows", "Darwin"} or shutil.which("xdotool") is not None,
         }
-        executed = self._send_key(key_map[action])
-        return {"action": action, "executed": executed, "method": method}
 
 
 presentation_controller = PresentationController()
@@ -1087,12 +1385,44 @@ async def recognise_voice(payload: VoiceRecognitionPayload) -> Dict[str, Any]:
     return recognise_voice_command(payload)
 
 
+@app.post("/api/voice/transcribe")
+async def transcribe_voice(payload: VoiceAudioPayload) -> Dict[str, Any]:
+    audio = _decode_frame(payload.data)
+    if audio is None:
+        raise HTTPException(status_code=400, detail="音频数据格式无效")
+
+    transcription = await run_in_threadpool(voice_transcriber.transcribe_wav, audio)
+    if transcription["error"]:
+        raise HTTPException(status_code=500, detail=f"本地语音识别失败：{transcription['error']}")
+
+    command_result = recognise_voice_command(
+        VoiceRecognitionPayload(
+            text=transcription["text"],
+            isFinal=True,
+            showEndConfirm=payload.showEndConfirm,
+        )
+    )
+    return {
+        **command_result,
+        "text": transcription["text"],
+        "transcript": transcription["text"],
+        "engine": "vosk",
+        "model": transcription["model"],
+        "sampleRate": transcription["sampleRate"],
+    }
+
+
 @app.post("/api/presentation/control")
 async def control_presentation(payload: ControlCommandPayload) -> Dict[str, Any]:
     try:
         return presentation_controller.execute(payload.action)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/presentation/control/status")
+async def presentation_control_status() -> Dict[str, Any]:
+    return presentation_controller.status()
 
 
 @sio.event

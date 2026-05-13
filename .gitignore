@@ -30,6 +30,9 @@ coverage
 *.tsbuildinfo
 
 # Python backend
+.venv/
+.cache/
 __pycache__/
 *.py[cod]
 airslide-backend/storage/
+airslide-backend/models/
