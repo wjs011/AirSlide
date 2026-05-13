@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   ArrowLeft,
   ArrowRight,
@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Eraser,
   Expand,
   FileUp,
   Hand,
@@ -15,6 +16,7 @@ import {
   Mic,
   Minus,
   Monitor,
+  RotateCcw,
   Pause,
   PenLine,
   Settings,
@@ -39,7 +41,7 @@ type PresentationManifest = {
   slides: Slide[]
 }
 
-type ToolMode = 'pointer' | 'pen' | 'zoom'
+type ToolMode = 'pointer' | 'pen' | 'eraser' | 'zoom'
 
 type Point = {
   x: number
@@ -49,6 +51,14 @@ type Point = {
 type AnnotationLine = {
   id: number
   points: Point[]
+}
+
+type OnboardingStep = {
+  title: string
+  summary: string
+  cue: string
+  steps: string[]
+  notes: string[]
 }
 
 type VisionResult = {
@@ -104,6 +114,7 @@ type CommandAction =
   | 'previous'
   | 'pointer'
   | 'pen'
+  | 'eraser'
   | 'zoom'
   | 'pause'
   | 'resume'
@@ -162,6 +173,7 @@ type ExternalControlResult = {
 
 const apiBase = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '')
 
+const shellRef = ref<HTMLElement | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
 const stageRef = ref<HTMLElement | null>(null)
 const videoRef = ref<HTMLVideoElement | null>(null)
@@ -199,13 +211,20 @@ const lastVoiceError = ref('')
 const showEndConfirm = ref(false)
 const pendingEndByVoice = ref(false)
 const showSettings = ref(false)
+const showAnnotationActions = ref(false)
+const showHandDebugPanel = ref(false)
 const externalControlEnabled = ref(false)
 const externalControlStatus = ref('外部控制待检测')
+const fullscreenPresentationActive = ref(false)
+const fullscreenChromeVisible = ref(true)
+const showOnboarding = ref(true)
+const expandedOnboardingStep = ref<number | null>(null)
 const visionSettings = ref<VisionSettings>({
   cooldownSeconds: 5,
   swipeThreshold: 0.02,
   confidenceThreshold: 0.45,
 })
+const eraserRadius = 0.022
 
 let timerId: number | undefined
 let visionTimerId: number | undefined
@@ -225,6 +244,7 @@ let voiceChunks: Float32Array[] = []
 let voiceChunkSampleCount = 0
 let voiceFlushTimerId: number | undefined
 let voiceRequestInFlight = false
+let fullscreenChromeTimerId: number | undefined
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value))
@@ -695,6 +715,54 @@ const processSteps = [
   },
 ]
 
+const onboardingSteps: OnboardingStep[] = [
+  {
+    title: '\u5bfc\u5165\u4e0e\u653e\u6620\u51c6\u5907',
+    summary: '\u5148\u5bfc\u5165 PPT\uff0c\u7cfb\u7edf\u4f1a\u81ea\u52a8\u8fdb\u5165\u653e\u6620\u754c\u9762\u3002',
+    cue: '\u9002\u7528\u573a\u666f\uff1a\u9996\u6b21\u5f00\u59cb\u6f14\u793a\u6216\u66f4\u6362\u65b0\u7684 PPT \u6587\u4ef6\u3002',
+    steps: [
+      '\u70b9\u51fb\u201c\u5bfc\u5165 PPT \u5f00\u59cb\u653e\u6620\u201d\u9009\u62e9 .ppt \u6216 .pptx \u6587\u4ef6\u3002',
+      '\u7b49\u5f85\u7cfb\u7edf\u5b8c\u6210\u8f6c\u6362\uff0c\u4e0d\u8981\u5728\u8f6c\u6362\u8fc7\u7a0b\u4e2d\u91cd\u590d\u70b9\u51fb\u3002',
+      '\u8fdb\u5165\u4e3b\u754c\u9762\u540e\u518d\u5f00\u542f\u6444\u50cf\u5934\u5e76\u5f00\u59cb\u6f14\u793a\u3002',
+    ],
+    notes: [
+      '\u53ea\u652f\u6301 .ppt \u548c .pptx \u6587\u4ef6\u3002',
+      '\u5efa\u8bae\u4f7f\u7528 16:9 \u9875\u9762\u6bd4\u4f8b\uff0c\u6295\u5f71\u663e\u793a\u66f4\u7a33\u5b9a\u3002',
+      '\u5bfc\u5165\u65b0\u6587\u4ef6\u4f1a\u66ff\u6362\u5f53\u524d\u653e\u6620\u5185\u5bb9\u3002',
+    ],
+  },
+  {
+    title: '\u6444\u50cf\u5934\u4e0e\u7ad9\u4f4d',
+    summary: '\u7ad9\u4f4d\u7a33\u5b9a\u540e\uff0c\u624b\u52bf\u8bc6\u522b\u4f1a\u66f4\u51c6\u786e\u3002',
+    cue: '\u9002\u7528\u573a\u666f\uff1a\u6b63\u5f0f\u6f14\u793a\u524d\u7684\u73af\u5883\u68c0\u67e5\u548c\u8bd5\u8fd0\u884c\u3002',
+    steps: [
+      '\u8ba9\u4eba\u8138\u51fa\u73b0\u5728\u5de6\u4e0a\u89d2\u9884\u89c8\u533a\u5185\uff0c\u4fdd\u6301\u8ddd\u79bb\u7ea6 2 \u5230 3 \u7c73\u3002',
+      '\u624b\u52bf\u52a8\u4f5c\u5c3d\u91cf\u5728\u80f8\u524d\u5230\u80a9\u90e8\u8303\u56f4\u5185\u5b8c\u6210\u3002',
+      '\u5148\u786e\u4fdd\u5149\u7ebf\u5747\u5300\uff0c\u518d\u8fdb\u884c\u624b\u52bf\u6d4b\u8bd5\u3002',
+    ],
+    notes: [
+      '\u907f\u514d\u9006\u5149\u3001\u53cd\u5149\u6216\u80cc\u666f\u592a\u590d\u6742\u3002',
+      '\u624b\u638c\u4e0d\u8981\u88ab\u8eab\u4f53\u3001\u8bb2\u684c\u6216\u8863\u7269\u906e\u6321\u3002',
+      '\u5982\u9700\u6392\u67e5\u95ee\u9898\uff0c\u53ef\u5728\u8bbe\u7f6e\u4e2d\u6253\u5f00\u624b\u52bf\u8c03\u8bd5\u9762\u677f\u3002',
+    ],
+  },
+  {
+    title: '\u624b\u52bf\u3001\u8bed\u97f3\u4e0e\u6807\u6ce8',
+    summary: '\u6f14\u793a\u8fc7\u7a0b\u4e2d\uff0c\u4e3b\u8981\u4f7f\u7528\u624b\u52bf\u3001\u8bed\u97f3\u548c\u5de5\u5177\u680f\u5b8c\u6210\u64cd\u4f5c\u3002',
+    cue: '\u9002\u7528\u573a\u666f\uff1a\u6b63\u5728\u8bb2\u89e3 PPT \u65f6\u7684\u5e38\u7528\u63a7\u5236\u3002',
+    steps: [
+      '\u624b\u52bf\u7528\u4e8e\u4e0a\u4e00\u9875\u3001\u4e0b\u4e00\u9875\u548c\u6307\u9488\u8ddf\u968f\u3002',
+      '\u8bed\u97f3\u53ef\u7528\u4e8e\u7ffb\u9875\u3001\u5207\u6362\u6807\u6ce8\u3001\u533a\u57df\u653e\u5927\u3001\u6682\u505c\u8bc6\u522b\u3002',
+      '\u6807\u6ce8\u5199\u9519\u65f6\uff0c\u5728\u201c\u4fee\u6b63\u201d\u91cc\u4f7f\u7528\u6a61\u76ae\u64e6\u6216\u4e00\u952e\u6e05\u9664\u3002',
+    ],
+    notes: [
+      '\u8fde\u7eed\u7ffb\u9875\u5b58\u5728\u51b7\u5374\u65f6\u95f4\uff0c\u8bf7\u4e0d\u8981\u5feb\u901f\u91cd\u590d\u6325\u624b\u3002',
+      '\u5168\u5c4f\u653e\u6620\u540e\uff0c\u4e0a\u4e0b\u5de5\u5177\u680f\u4f1a\u5728\u9f20\u6807\u79fb\u52a8\u65f6\u91cd\u65b0\u663e\u793a\u3002',
+      '\u7ed3\u675f\u6f14\u793a\u65f6\u9700\u8981\u4e8c\u6b21\u786e\u8ba4\uff0c\u907f\u514d\u8bef\u89e6\u3002',
+    ],
+  },
+]
+
 function slideUrl(slide: Slide) {
   if (/^https?:\/\//.test(slide.url)) return slide.url
   return `${apiBase}${slide.url}`
@@ -702,6 +770,15 @@ function slideUrl(slide: Slide) {
 
 function pickFile() {
   fileInput.value?.click()
+}
+
+function dismissOnboarding() {
+  showOnboarding.value = false
+}
+
+function startWithGuide() {
+  expandedOnboardingStep.value = null
+  showOnboarding.value = true
 }
 
 function validateFile(file: File) {
@@ -737,6 +814,7 @@ async function uploadFile(file: File) {
 
     deck.value = (await response.json()) as PresentationManifest
     currentIndex.value = 0
+    showOnboarding.value = false
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : 'PPT 载入失败'
   } finally {
@@ -793,6 +871,13 @@ function executeCommand(action: CommandAction, source: CommandSource = 'button')
   const needsCooldown = action === 'next' || action === 'previous'
   if (needsCooldown && !canTurnSlide(action)) return
 
+  if (action !== 'clear-annotations') {
+    showAnnotationActions.value = false
+  }
+  if (fullscreenPresentationActive.value) {
+    fullscreenChromeVisible.value = true
+  }
+
   const commandCooldownMs = source === 'gesture' ? 5000 : source === 'voice' ? 620 : 950
   if (needsCooldown && now - lastCommandAt < commandCooldownMs) return
   if (needsCooldown) lastCommandAt = now
@@ -801,10 +886,11 @@ function executeCommand(action: CommandAction, source: CommandSource = 'button')
   if (action === 'previous') previousSlide()
   if (action === 'first') goToSlide(0)
   if (action === 'last') goToSlide(slideCount.value - 1)
-  if (action === 'fullscreen') void enterFullscreen()
+  if (action === 'fullscreen') void toggleFullscreen()
   if (action === 'clear-annotations') clearAnnotations()
   if (action === 'pointer') activeMode.value = 'pointer'
   if (action === 'pen') activeMode.value = 'pen'
+  if (action === 'eraser') activeMode.value = 'eraser'
   if (action === 'zoom') activeMode.value = 'zoom'
   if (action === 'pause') recognitionPaused.value = true
   if (action === 'resume') recognitionPaused.value = false
@@ -862,8 +948,47 @@ async function loadExternalControlStatus() {
 }
 
 async function enterFullscreen() {
-  if (!stageRef.value || document.fullscreenElement) return
-  await stageRef.value.requestFullscreen()
+  if (!shellRef.value || document.fullscreenElement) return
+  await shellRef.value.requestFullscreen()
+}
+
+async function toggleFullscreen() {
+  if (document.fullscreenElement === shellRef.value) {
+    await document.exitFullscreen()
+    return
+  }
+  await enterFullscreen()
+}
+
+function clearFullscreenChromeTimer() {
+  if (fullscreenChromeTimerId !== undefined) {
+    window.clearTimeout(fullscreenChromeTimerId)
+    fullscreenChromeTimerId = undefined
+  }
+}
+
+function scheduleFullscreenChromeHide() {
+  clearFullscreenChromeTimer()
+  if (!fullscreenPresentationActive.value || showSettings.value || showEndConfirm.value) return
+  fullscreenChromeTimerId = window.setTimeout(() => {
+    fullscreenChromeVisible.value = false
+  }, 1800)
+}
+
+function revealFullscreenChrome() {
+  if (!fullscreenPresentationActive.value) return
+  fullscreenChromeVisible.value = true
+  scheduleFullscreenChromeHide()
+}
+
+function handleFullscreenChange() {
+  fullscreenPresentationActive.value = document.fullscreenElement === shellRef.value
+  fullscreenChromeVisible.value = true
+  if (fullscreenPresentationActive.value) {
+    scheduleFullscreenChromeHide()
+  } else {
+    clearFullscreenChromeTimer()
+  }
 }
 
 function startVisionLoop() {
@@ -1094,6 +1219,18 @@ function stopPreviewLoop() {
   }
 }
 
+async function attachVideoStream(video: HTMLVideoElement | null, stream: MediaStream | null) {
+  if (!video || !stream) return
+  if (video.srcObject !== stream) {
+    video.srcObject = stream
+  }
+  try {
+    await video.play()
+  } catch {
+    // Ignore autoplay timing issues and retry when the panel updates again.
+  }
+}
+
 async function startCamera() {
   cameraError.value = ''
   visionStatus.value = '正在请求摄像头权限'
@@ -1105,14 +1242,8 @@ async function startCamera() {
     cameraStream.value = stream
     cameraEnabled.value = true
     await nextTick()
-    if (videoRef.value) {
-      videoRef.value.srcObject = stream
-      await videoRef.value.play()
-    }
-    if (debugVideoRef.value) {
-      debugVideoRef.value.srcObject = stream
-      await debugVideoRef.value.play()
-    }
+    await attachVideoStream(videoRef.value, stream)
+    await attachVideoStream(debugVideoRef.value, stream)
     startPreviewLoop()
     startVisionLoop()
   } catch {
@@ -1147,6 +1278,15 @@ function toggleVoice() {
     void startVoice()
   }
 }
+
+watch(
+  [cameraStream, showHandDebugPanel, debugVideoRef],
+  async ([stream, visible, debugVideo]) => {
+    if (!stream || !visible || !debugVideo) return
+    await nextTick()
+    await attachVideoStream(debugVideoRef.value, stream)
+  },
+)
 
 function encodeWav(samples: Float32Array, sampleRate: number) {
   const buffer = new ArrayBuffer(44 + samples.length * 2)
@@ -1329,21 +1469,85 @@ function pointList(points: Point[]) {
 }
 
 function handleStagePointerMove(event: PointerEvent) {
+  if (fullscreenPresentationActive.value) {
+    revealFullscreenChrome()
+  }
   if (activeMode.value === 'zoom') {
     zoomPoint.value = stagePoint(event)
   }
 }
 
+function distanceBetween(left: Point, right: Point) {
+  const dx = left.x - right.x
+  const dy = left.y - right.y
+  return Math.sqrt(dx * dx + dy * dy)
+}
+
+function simplifyAnnotationLine(points: Point[]) {
+  if (points.length <= 1) return points
+  const simplified: Point[] = [points[0]]
+  for (let index = 1; index < points.length; index += 1) {
+    const point = points[index]
+    if (distanceBetween(point, simplified[simplified.length - 1]) >= 0.0035) {
+      simplified.push(point)
+    }
+  }
+  if (simplified[simplified.length - 1] !== points[points.length - 1]) {
+    simplified.push(points[points.length - 1])
+  }
+  return simplified
+}
+
+function eraseAtPoint(point: Point) {
+  const nextLines: AnnotationLine[] = []
+  for (const line of annotations.value) {
+    let currentSegment: Point[] = []
+    const segments: Point[][] = []
+
+    for (const linePoint of line.points) {
+      if (distanceBetween(linePoint, point) <= eraserRadius) {
+        if (currentSegment.length >= 2) segments.push(currentSegment)
+        currentSegment = []
+        continue
+      }
+      currentSegment.push(linePoint)
+    }
+
+    if (currentSegment.length >= 2) segments.push(currentSegment)
+
+    if (!segments.length && line.points.every((linePoint) => distanceBetween(linePoint, point) > eraserRadius)) {
+      nextLines.push(line)
+      continue
+    }
+
+    for (const segment of segments) {
+      const simplified = simplifyAnnotationLine(segment)
+      if (simplified.length >= 2) {
+        nextLines.push({ id: annotationId++, points: simplified })
+      }
+    }
+  }
+  annotations.value = nextLines
+}
+
 function startAnnotation(event: PointerEvent) {
-  if (activeMode.value !== 'pen') return
+  if (activeMode.value !== 'pen' && activeMode.value !== 'eraser') return
   const target = event.currentTarget as HTMLElement
   target.setPointerCapture?.(event.pointerId)
+  if (activeMode.value === 'eraser') {
+    eraseAtPoint(stagePoint(event))
+    return
+  }
   const line = { id: annotationId++, points: [stagePoint(event)] }
   drawingLine.value = line
   annotations.value.push(line)
 }
 
 function moveAnnotation(event: PointerEvent) {
+  if (activeMode.value === 'eraser') {
+    eraseAtPoint(stagePoint(event))
+    return
+  }
   if (activeMode.value !== 'pen' || !drawingLine.value) return
   drawingLine.value.points.push(stagePoint(event))
 }
@@ -1356,10 +1560,15 @@ function stopAnnotation(event: PointerEvent) {
 
 function clearAnnotations() {
   annotations.value = []
+  showAnnotationActions.value = false
+  revealFullscreenChrome()
 }
 
 function requestEndPresentation() {
   showEndConfirm.value = true
+  showAnnotationActions.value = false
+  fullscreenChromeVisible.value = true
+  clearFullscreenChromeTimer()
 }
 
 function confirmEndPresentation() {
@@ -1368,14 +1577,18 @@ function confirmEndPresentation() {
   activeMode.value = 'pointer'
   recognitionPaused.value = false
   annotations.value = []
+  showAnnotationActions.value = false
   showEndConfirm.value = false
   pendingEndByVoice.value = false
+  revealFullscreenChrome()
 }
 
 function cancelEndPresentation() {
   showEndConfirm.value = false
   pendingEndByVoice.value = false
+  revealFullscreenChrome()
 }
+
 
 function handleKeydown(event: KeyboardEvent) {
   const target = event.target as HTMLElement | null
@@ -1405,6 +1618,7 @@ function handleKeydown(event: KeyboardEvent) {
 
 onMounted(() => {
   window.addEventListener('keydown', handleKeydown)
+  document.addEventListener('fullscreenchange', handleFullscreenChange)
   void loadVisionSettings()
   void loadExternalControlStatus()
   timerId = window.setInterval(() => {
@@ -1414,7 +1628,9 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleKeydown)
+  document.removeEventListener('fullscreenchange', handleFullscreenChange)
   if (timerId) window.clearInterval(timerId)
+  clearFullscreenChromeTimer()
   stopPreviewLoop()
   stopVoice()
   stopCamera()
@@ -1422,7 +1638,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="prototype-shell">
+  <main ref="shellRef" class="prototype-shell" :class="{ 'presentation-mode': fullscreenPresentationActive, 'chrome-hidden': fullscreenPresentationActive && !fullscreenChromeVisible }">
     <input
       ref="fileInput"
       class="sr-only"
@@ -1432,7 +1648,7 @@ onBeforeUnmount(() => {
     />
     <canvas ref="frameCanvasRef" class="sr-only" aria-hidden="true"></canvas>
 
-    <header class="top-bar">
+    <header v-if="hasDeck" class="top-bar" :class="{ hidden: fullscreenPresentationActive && !fullscreenChromeVisible }" @pointermove="revealFullscreenChrome">
       <section class="brand-zone">
         <div class="app-logo">
           <span></span>
@@ -1497,7 +1713,7 @@ onBeforeUnmount(() => {
           <img class="real-slide" :src="slideUrl(currentSlide)" :alt="`PPT 第 ${currentSlide.index} 页`" />
         </template>
 
-        <template v-else>
+        <template v-else-if="hasDeck">
           <section class="demo-slide">
             <div class="slide-bg-line line-one"></div>
             <div class="slide-bg-line line-two"></div>
@@ -1538,9 +1754,45 @@ onBeforeUnmount(() => {
           </section>
         </template>
 
+        <section v-if="!hasDeck" class="launchpad-overlay">
+          <div class="launchpad-glow launchpad-glow-left"></div>
+          <div class="launchpad-glow launchpad-glow-right"></div>
+
+          <div class="launchpad-header">
+            <div class="launchpad-badge">
+              <Monitor :size="16" />
+              <span>AirSlide 放映控制台</span>
+            </div>
+            <button class="launchpad-guide-link" type="button" @click="startWithGuide">
+              查看上手教程
+            </button>
+          </div>
+
+          <div class="launchpad-content">
+            <section class="launchpad-copy">
+              <h2>先导入 PPT，再进入放映控制</h2>
+              <p>
+                当前启动页只保留最终交付所需入口。导入成功后，系统会进入放映界面，并启用摄像头预览、手势翻页、语音辅助和标注工具。
+              </p>
+              <div class="launchpad-highlights">
+                <span>支持 .ppt / .pptx</span>
+                <span>适配投影放映场景</span>
+                <span>导入后进入完整控制台</span>
+              </div>
+            </section>
+
+            <button class="launchpad-upload" type="button" :disabled="isUploading" @click="pickFile">
+              <Loader2 v-if="isUploading" :size="22" class="spin" />
+              <UploadCloud v-else :size="22" />
+              <strong>{{ isUploading ? '正在转换 PPT' : '导入 PPT 开始放映' }}</strong>
+              <span>{{ isUploading ? '请稍等，系统正在生成放映页' : '点击选择文件，或直接将文件拖入当前区域' }}</span>
+            </button>
+          </div>
+        </section>
+
         <svg
           class="annotation-layer"
-          :class="{ drawable: activeMode === 'pen' }"
+          :class="{ drawable: activeMode === 'pen' || activeMode === 'eraser', erasing: activeMode === 'eraser' }"
           viewBox="0 0 100 100"
           preserveAspectRatio="none"
           @pointerdown="startAnnotation"
@@ -1567,7 +1819,7 @@ onBeforeUnmount(() => {
           <b>2.2x</b>
         </div>
 
-        <aside class="camera-preview">
+        <aside v-if="hasDeck" class="camera-preview">
           <span class="camera-dot"></span>
           <div v-if="cameraEnabled" class="camera-video-surface">
             <canvas ref="previewCanvasRef" class="camera-preview-canvas"></canvas>
@@ -1590,7 +1842,7 @@ onBeforeUnmount(() => {
           </div>
         </aside>
 
-        <aside class="hand-debug-panel">
+        <aside v-if="hasDeck && showHandDebugPanel" class="hand-debug-panel">
           <header>
             <span>手指调试</span>
             <b :class="{ ready: visionResult?.debug?.pageTurnArmed }">{{ debugStatusText }}</b>
@@ -1616,7 +1868,7 @@ onBeforeUnmount(() => {
           <p>{{ debugDetailText }}</p>
         </aside>
 
-        <aside class="assist-card">
+        <aside v-if="hasDeck" class="assist-card">
           <p>
             <Hand :size="23" />
             <span>{{ gestureText }}</span>
@@ -1631,11 +1883,6 @@ onBeforeUnmount(() => {
           </p>
           <small>{{ visionStatus }} · {{ modeText }}</small>
         </aside>
-
-        <button v-if="!hasDeck" class="quick-upload" type="button" @click="pickFile">
-          <UploadCloud :size="18" />
-          <span>上传真实 PPT</span>
-        </button>
 
         <div v-if="isUploading" class="loading-mask">
           <Loader2 :size="26" class="spin" />
@@ -1652,7 +1899,7 @@ onBeforeUnmount(() => {
       </article>
     </section>
 
-    <footer class="bottom-bar">
+    <footer v-if="hasDeck" class="bottom-bar" :class="{ hidden: fullscreenPresentationActive && !fullscreenChromeVisible }" @pointermove="revealFullscreenChrome">
       <button class="collapse-button" type="button">
         <ChevronUp :size="30" />
       </button>
@@ -1679,9 +1926,35 @@ onBeforeUnmount(() => {
           <PenLine :size="32" />
           <span>标注</span>
         </button>
+        <div class="tool-button-group">
+          <button
+            class="tool-button compact"
+            :class="{ selected: activeMode === 'eraser' || showAnnotationActions }"
+            type="button"
+            :disabled="annotations.length === 0"
+            @click="showAnnotationActions = !showAnnotationActions"
+          >
+            <Eraser :size="28" />
+            <span>修正</span>
+          </button>
+          <div v-if="showAnnotationActions && annotations.length > 0" class="annotation-actions-menu">
+            <button type="button" :class="{ active: activeMode === 'eraser' }" @click="executeCommand('eraser')">
+              <Eraser :size="16" />
+              <span>橡皮擦</span>
+            </button>
+            <button type="button" @click="executeCommand('clear-annotations')">
+              <RotateCcw :size="16" />
+              <span>一键清除</span>
+            </button>
+          </div>
+        </div>
         <button class="tool-button" :class="{ selected: activeMode === 'zoom' }" type="button" @click="executeCommand('zoom')">
           <Expand :size="32" />
           <span>区域放大</span>
+        </button>
+        <button class="tool-button" :class="{ active: fullscreenPresentationActive }" type="button" @click="executeCommand('fullscreen')">
+          <Maximize2 :size="30" />
+          <span>{{ fullscreenPresentationActive ? '退出全屏' : '全屏放映' }}</span>
         </button>
         <button class="tool-button" type="button" @click="executeCommand(recognitionPaused ? 'resume' : 'pause')">
           <Pause :size="34" />
@@ -1753,6 +2026,14 @@ onBeforeUnmount(() => {
 
         <label class="toggle-row">
           <span>
+            显示手势调试面板
+            <small>仅用于调试手部识别、手势姿态和翻页触发状态，正式演示建议关闭</small>
+          </span>
+          <input v-model="showHandDebugPanel" type="checkbox" />
+        </label>
+
+        <label class="toggle-row">
+          <span>
             控制外部 PowerPoint
             <small>{{ externalControlStatus }}，开启后命令会同步发送给前台放映窗口</small>
           </span>
@@ -1762,6 +2043,57 @@ onBeforeUnmount(() => {
         <footer>
           <button type="button" @click="showSettings = false">取消</button>
           <button class="primary" type="button" @click="saveVisionSettings">保存设置</button>
+        </footer>
+      </article>
+    </section>
+    <section v-if="showOnboarding && !hasDeck" class="confirm-layer onboarding-layer">
+      <article class="onboarding-dialog">
+        <header>
+          <div>
+            <p>三步上手</p>
+            <h2>AirSlide 使用教程</h2>
+          </div>
+          <button type="button" @click="dismissOnboarding" aria-label="跳过教程">
+            <X :size="20" />
+          </button>
+        </header>
+
+        <div class="onboarding-steps">
+          <article v-for="(step, index) in onboardingSteps" :key="step.title" class="onboarding-step">
+            <div class="onboarding-step-index">
+              {{ String(index + 1).padStart(2, '0') }}
+            </div>
+            <div class="onboarding-step-copy">
+              <h3>{{ step.title }}</h3>
+              <p>{{ step.summary }}</p>
+              <small class="onboarding-step-cue">{{ step.cue }}</small>
+              <button
+                class="onboarding-detail-toggle"
+                type="button"
+                @click="expandedOnboardingStep = expandedOnboardingStep === index ? null : index"
+              >
+                {{ expandedOnboardingStep === index ? '收起详细说明' : '查看详细说明' }}
+              </button>
+              <div v-if="expandedOnboardingStep === index" class="onboarding-detail-panel">
+                <section class="onboarding-detail-group">
+                  <h4>使用步骤</h4>
+                  <ol class="onboarding-step-list">
+                    <li v-for="entry in step.steps" :key="entry">{{ entry }}</li>
+                  </ol>
+                </section>
+                <section class="onboarding-detail-group">
+                  <h4>注意事项</h4>
+                  <ul class="onboarding-rule-list">
+                    <li v-for="note in step.notes" :key="note">{{ note }}</li>
+                  </ul>
+                </section>
+              </div>
+            </div>
+          </article>
+        </div>
+
+        <footer>
+          <button class="primary" type="button" @click="dismissOnboarding">我知道了</button>
         </footer>
       </article>
     </section>
@@ -1814,6 +2146,25 @@ onBeforeUnmount(() => {
   align-items: center;
   background: rgb(10 20 35 / 0.96);
   box-shadow: 0 10px 34px rgb(0 0 0 / 0.28);
+  transition:
+    opacity 180ms ease,
+    transform 220ms ease,
+    visibility 180ms ease;
+}
+
+.top-bar.hidden,
+.bottom-bar.hidden {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.top-bar.hidden {
+  transform: translateY(-14px);
+}
+
+.bottom-bar.hidden {
+  transform: translateY(14px);
 }
 
 .top-bar {
@@ -2023,6 +2374,29 @@ onBeforeUnmount(() => {
   background: linear-gradient(180deg, #07111f 0%, #0f1b2a 100%);
 }
 
+.prototype-shell.presentation-mode .stage-area {
+  --stage-max-height: calc(100dvh - var(--stage-pad) * 2);
+}
+
+.prototype-shell.presentation-mode {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.prototype-shell.presentation-mode .top-bar,
+.prototype-shell.presentation-mode .bottom-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+}
+
+.prototype-shell.presentation-mode .top-bar {
+  top: 0;
+}
+
+.prototype-shell.presentation-mode .bottom-bar {
+  bottom: 0;
+}
+
 .presentation-stage {
   position: relative;
   width: min(100%, 1880px, calc(var(--stage-max-height) * 16 / 9));
@@ -2132,6 +2506,159 @@ onBeforeUnmount(() => {
   color: white;
   padding: var(--space-2xs) var(--space-xs);
   font-size: var(--font-xs);
+}
+
+.launchpad-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: clamp(22px, min(2.4vw, 4.2vh), 38px);
+  background:
+    radial-gradient(circle at 18% 20%, rgb(68 132 255 / 0.2), transparent 24%),
+    radial-gradient(circle at 82% 22%, rgb(19 213 157 / 0.14), transparent 20%),
+    linear-gradient(180deg, rgb(7 17 31 / 1), rgb(11 22 39 / 1));
+}
+
+.launchpad-glow {
+  position: absolute;
+  width: clamp(160px, min(18vw, 28vh), 320px);
+  height: clamp(160px, min(18vw, 28vh), 320px);
+  border-radius: 999px;
+  filter: blur(18px);
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.launchpad-glow-left {
+  left: -60px;
+  top: -50px;
+  background: rgb(47 111 240 / 0.34);
+}
+
+.launchpad-glow-right {
+  right: -70px;
+  bottom: -70px;
+  background: rgb(19 213 157 / 0.22);
+}
+
+.launchpad-header,
+.launchpad-content {
+  position: relative;
+  z-index: 1;
+}
+
+.launchpad-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+}
+
+.launchpad-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgb(255 255 255 / 0.12);
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.06);
+  color: #dce9fb;
+  padding: 8px 12px;
+  font-size: var(--font-sm);
+  font-weight: 700;
+}
+
+.launchpad-guide-link {
+  border: 0;
+  background: transparent;
+  color: #98bfff;
+  padding: 6px 0;
+  font-size: var(--font-sm);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.launchpad-guide-link:hover {
+  color: #c5ddff;
+}
+
+.launchpad-content {
+  display: grid;
+  gap: clamp(20px, min(2vw, 3vh), 30px);
+  width: min(100%, 920px);
+  margin: auto;
+  text-align: center;
+}
+
+.launchpad-copy h2 {
+  margin: 0;
+  color: white;
+  font-size: clamp(30px, min(3.6vw, 6vh), 58px);
+  font-weight: 800;
+  line-height: 1.08;
+}
+
+.launchpad-copy p {
+  margin: clamp(14px, min(1.3vw, 2.2vh), 22px) auto 0;
+  max-width: 760px;
+  color: #b6c6da;
+  font-size: clamp(14px, min(1.1vw, 1.9vh), 20px);
+  line-height: 1.8;
+}
+
+.launchpad-highlights {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-top: clamp(16px, min(1.5vw, 2.4vh), 24px);
+}
+
+.launchpad-highlights span {
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.05);
+  color: #dce8f7;
+  padding: 8px 14px;
+  font-size: var(--font-sm);
+  font-weight: 600;
+}
+
+.launchpad-upload {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  width: min(100%, 560px);
+  margin: 0 auto;
+  border: 1px solid rgb(88 142 234 / 0.44);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgb(28 72 141 / 0.35), rgb(16 38 66 / 0.78));
+  color: white;
+  padding: clamp(20px, min(2vw, 3vh), 28px);
+  cursor: pointer;
+  box-shadow: 0 20px 52px rgb(4 13 26 / 0.34);
+}
+
+.launchpad-upload:hover:not(:disabled) {
+  border-color: rgb(127 173 255 / 0.7);
+  transform: translateY(-1px);
+}
+
+.launchpad-upload strong {
+  font-size: clamp(18px, min(1.5vw, 2.4vh), 26px);
+  font-weight: 800;
+}
+
+.launchpad-upload span {
+  color: #b7cae4;
+  font-size: var(--font-sm);
+}
+
+.launchpad-upload:disabled {
+  cursor: progress;
+  opacity: 0.82;
 }
 
 .demo-slide {
@@ -2772,6 +3299,14 @@ onBeforeUnmount(() => {
   gap: clamp(6px, min(1.5vw, 2.6vh), 38px);
 }
 
+.tool-button-group {
+  position: relative;
+  display: flex;
+  flex: 1 1 clamp(86px, min(7.4vw, 13vh), 126px);
+  min-width: 0;
+  max-width: clamp(112px, min(9.4vw, 16vh), 176px);
+}
+
 .tool-button {
   display: inline-flex;
   flex: 1 1 clamp(86px, min(7.4vw, 13vh), 126px);
@@ -2794,6 +3329,10 @@ onBeforeUnmount(() => {
     background-color 160ms ease,
     color 160ms ease,
     transform 160ms ease;
+}
+
+.tool-button.compact {
+  max-width: none;
 }
 
 .tool-button:hover:not(:disabled) {
@@ -2821,6 +3360,49 @@ onBeforeUnmount(() => {
 
 .tool-button.danger svg {
   fill: currentColor;
+}
+
+.annotation-actions-menu {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 10px);
+  z-index: 20;
+  display: grid;
+  gap: 8px;
+  width: clamp(124px, min(10vw, 16vh), 168px);
+  padding: 8px;
+  transform: translateX(-50%);
+  border: 1px solid rgb(255 255 255 / 0.12);
+  border-radius: 12px;
+  background: linear-gradient(180deg, rgb(18 32 52 / 0.98), rgb(12 21 36 / 0.98));
+  box-shadow: 0 16px 34px rgb(0 0 0 / 0.34);
+}
+
+.annotation-actions-menu button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 38px;
+  border: 1px solid rgb(255 255 255 / 0.08);
+  border-radius: 10px;
+  background: rgb(255 255 255 / 0.06);
+  color: #eff5ff;
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.annotation-actions-menu button:hover {
+  border-color: rgb(122 169 255 / 0.58);
+  background: rgb(53 97 164 / 0.32);
+}
+
+.annotation-actions-menu button.active {
+  border-color: rgb(71 132 242 / 0.72);
+  background: rgb(37 93 167 / 0.34);
+  color: #8ebcff;
 }
 
 .footer-meta {
@@ -2853,6 +3435,183 @@ onBeforeUnmount(() => {
   background: linear-gradient(180deg, rgb(18 32 52 / 0.98), rgb(12 21 36 / 0.98));
   box-shadow: 0 28px 80px rgb(0 0 0 / 0.42);
   padding: var(--space-lg);
+}
+
+.onboarding-layer {
+  z-index: 60;
+}
+
+.onboarding-dialog {
+  width: min(640px, calc(100vw - 32px));
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-radius: clamp(10px, min(1vw, 1.6vh), 16px);
+  background: linear-gradient(180deg, rgb(18 32 52 / 0.98), rgb(12 21 36 / 0.98));
+  box-shadow: 0 28px 80px rgb(0 0 0 / 0.42);
+  padding: clamp(18px, min(1.6vw, 2.6vh), 28px);
+}
+
+.onboarding-dialog header,
+.settings-dialog header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-md);
+}
+
+.onboarding-dialog header p {
+  margin: 0 0 6px;
+  color: #88b5ff;
+  font-size: var(--font-sm);
+  font-weight: 700;
+}
+
+.onboarding-dialog header h2 {
+  margin: 0;
+  color: white;
+  font-size: clamp(22px, min(1.8vw, 3vh), 32px);
+}
+
+.onboarding-dialog header button,
+.settings-dialog header button {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 1px solid rgb(255 255 255 / 0.12);
+  border-radius: 10px;
+  background: rgb(255 255 255 / 0.06);
+  color: #dbe7f9;
+  cursor: pointer;
+}
+
+.onboarding-steps {
+  display: grid;
+  gap: 12px;
+  margin: 22px 0;
+}
+
+.onboarding-step {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+  border: 1px solid rgb(255 255 255 / 0.08);
+  border-radius: 14px;
+  background: rgb(255 255 255 / 0.05);
+  padding: 14px;
+}
+
+.onboarding-step-index {
+  display: grid;
+  width: 52px;
+  height: 52px;
+  place-items: center;
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgb(42 105 213 / 0.7), rgb(22 64 130 / 0.95));
+  color: white;
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.onboarding-step-copy h3 {
+  margin: 2px 0 6px;
+  color: white;
+  font-size: var(--font-lg);
+}
+
+.onboarding-step-copy p {
+  margin: 0;
+  color: #b8c7dc;
+  line-height: 1.65;
+}
+
+.onboarding-step-cue {
+  display: block;
+  margin-top: 8px;
+  color: #8ea3c0;
+  font-size: var(--font-xs);
+  line-height: 1.6;
+}
+
+.onboarding-rule-list {
+  margin: 0;
+  padding-left: 18px;
+  color: #d9e5f4;
+  line-height: 1.7;
+}
+
+.onboarding-step-list {
+  margin: 0;
+  padding-left: 18px;
+  color: #e8eef8;
+  line-height: 1.75;
+}
+
+.onboarding-step-list li + li,
+.onboarding-rule-list li + li {
+  margin-top: 6px;
+}
+
+.onboarding-detail-toggle {
+  margin-top: 10px;
+  border: 0;
+  background: transparent;
+  color: #8ebcff;
+  padding: 0;
+  font-size: var(--font-sm);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.onboarding-detail-panel {
+  display: grid;
+  gap: 14px;
+  margin-top: 12px;
+  border: 1px solid rgb(255 255 255 / 0.08);
+  border-radius: 12px;
+  background: rgb(255 255 255 / 0.04);
+  padding: 12px 14px;
+}
+
+.onboarding-detail-group {
+  display: grid;
+  gap: 8px;
+}
+
+.onboarding-detail-group h4 {
+  margin: 0;
+  color: #dbe8f8;
+  font-size: var(--font-sm);
+  font-weight: 700;
+}
+
+.onboarding-detail-panel p {
+  margin: 0;
+  color: #aebdd3;
+  line-height: 1.7;
+}
+
+.onboarding-dialog footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+}
+
+.onboarding-dialog footer button {
+  height: clamp(38px, min(2.8vw, 4.8vh), 44px);
+  border: 1px solid rgb(255 255 255 / 0.14);
+  border-radius: 12px;
+  background: rgb(255 255 255 / 0.08);
+  color: white;
+  padding: 0 16px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.onboarding-dialog footer button.primary {
+  border-color: rgb(45 145 255 / 0.38);
+  background: rgb(45 145 255 / 0.18);
+  color: #b9d6ff;
 }
 
 .settings-dialog header,
@@ -3171,6 +3930,44 @@ onBeforeUnmount(() => {
 @media (max-width: 720px) {
   .prototype-shell {
     min-height: 100dvh;
+  }
+
+  .launchpad-overlay {
+    padding: 18px;
+  }
+
+  .launchpad-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .launchpad-copy h2 {
+    font-size: clamp(26px, 9vw, 36px);
+  }
+
+  .launchpad-highlights {
+    justify-content: flex-start;
+  }
+
+  .launchpad-upload {
+    width: 100%;
+    padding: 18px 16px;
+  }
+
+  .onboarding-dialog {
+    padding: 18px;
+  }
+
+  .onboarding-step {
+    grid-template-columns: 44px minmax(0, 1fr);
+    padding: 12px;
+  }
+
+  .onboarding-step-index {
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    font-size: 16px;
   }
 
   .top-bar {

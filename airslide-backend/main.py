@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import json
+import os
 import platform
 import re
 import shutil
@@ -97,6 +98,7 @@ class VoiceCommandPattern(BaseModel):
 class VoiceTranscriber:
     def __init__(self) -> None:
         self.model_dir = BASE_DIR / "models" / "vosk-model-small-cn-0.22"
+        self.runtime_model_dir = self.model_dir
         self._model: Any = None
         self._error: Optional[str] = None
 
@@ -108,12 +110,20 @@ class VoiceTranscriber:
         try:
             from vosk import Model
 
-            self._model = Model(str(self.model_dir))
+            self.runtime_model_dir = self._prepare_runtime_model_dir()
+            self._model = Model(str(self.runtime_model_dir))
             self._error = None
             return self._model
         except Exception as exc:
             self._error = str(exc)
             raise
+
+    def _prepare_runtime_model_dir(self) -> Path:
+        safe_root = Path(os.environ.get("TEMP", str(BASE_DIR / "storage"))) / "airslide-vosk"
+        safe_model_dir = safe_root / self.model_dir.name
+        if not safe_model_dir.exists():
+            shutil.copytree(self.model_dir, safe_model_dir)
+        return safe_model_dir
 
     def transcribe_wav(self, audio: bytes) -> Dict[str, Any]:
         model = self._load_model()
@@ -190,7 +200,18 @@ class VisionManager:
             self.cv2 = cv2
             self.np = np
             cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-            self.face_cascade = cv2.CascadeClassifier(str(cascade_path))
+            if not cascade_path.exists():
+                raise FileNotFoundError(f"OpenCV cascade not found: {cascade_path}")
+
+            safe_cascade_dir = Path(os.environ.get("TEMP", BASE_DIR / "storage")) / "airslide-opencv"
+            safe_cascade_dir.mkdir(parents=True, exist_ok=True)
+            safe_cascade_path = safe_cascade_dir / cascade_path.name
+            if not safe_cascade_path.exists():
+                shutil.copyfile(cascade_path, safe_cascade_path)
+
+            self.face_cascade = cv2.CascadeClassifier(str(safe_cascade_path))
+            if self.face_cascade.empty():
+                raise RuntimeError(f"Failed to load OpenCV cascade: {safe_cascade_path}")
         except Exception as exc:
             self.cv2 = None
             self.np = None
@@ -198,9 +219,30 @@ class VisionManager:
             self._opencv_error = str(exc)
 
         try:
-            import mediapipe as mp
+            try:
+                from mediapipe.python import solutions as mp_solutions
+                from mediapipe.python.solutions import hands as mp_hands_module
+                from mediapipe.python import solution_base as mp_solution_base
+            except Exception:
+                import mediapipe as mp
 
-            self.mp_hands = mp.solutions.hands
+                mp_solutions = mp.solutions
+                mp_hands_module = mp_solutions.hands
+                mp_solution_base = None
+
+            hands_binarypb = (
+                Path(mp_hands_module.__file__).resolve().parents[2]
+                / "modules"
+                / "hand_landmark"
+                / "hand_landmark_tracking_cpu.binarypb"
+            )
+            if hands_binarypb.exists():
+                safe_mp_root = self._prepare_mediapipe_resource_root(hands_binarypb.parents[1])
+                if mp_solution_base is not None:
+                    mp_solution_base.__file__ = str(safe_mp_root / "python" / "solution_base.py")
+                mp_hands_module._BINARYPB_FILE_PATH = "mediapipe/modules/hand_landmark/hand_landmark_tracking_cpu.binarypb"
+
+            self.mp_hands = mp_solutions.hands
             self.hands = self.mp_hands.Hands(
                 static_image_mode=False,
                 max_num_hands=1,
@@ -215,6 +257,14 @@ class VisionManager:
 
     def _empty_result(self, started_at: float, status: str = "no-signal") -> VisionResult:
         return VisionResult(status=status, latency_ms=int((time.perf_counter() - started_at) * 1000))
+
+    def _prepare_mediapipe_resource_root(self, source_modules_dir: Path) -> Path:
+        safe_root = Path(os.environ.get("TEMP", str(BASE_DIR / "storage"))) / "airslide-mediapipe" / "mediapipe"
+        safe_modules_dir = safe_root / "modules"
+        if not safe_modules_dir.exists():
+            shutil.copytree(source_modules_dir, safe_modules_dir)
+        (safe_root / "python").mkdir(parents=True, exist_ok=True)
+        return safe_root
 
     def _decode_image(self, frame: bytes) -> Optional[Any]:
         if self.cv2 is None or self.np is None:
